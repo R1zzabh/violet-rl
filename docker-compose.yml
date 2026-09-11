@@ -1,0 +1,54 @@
+# docker-compose.yml — VIOLET
+
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: violet
+      POSTGRES_PASSWORD: violet_dev_password
+      POSTGRES_DB: violet
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U violet -d violet"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  backend:
+    build:
+      context: .
+      dockerfile: docker/backend/Dockerfile
+    environment:
+      DATABASE_URL: postgresql://violet:violet_dev_password@db:5432/violet
+      ENVIRONMENT: production
+      LOG_LEVEL: info
+      FRONTEND_URL: http://localhost:3000
+    ports:
+      - "8000:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+    volumes:
+      - ./experiments:/app/experiments
+      - ./artifacts:/app/artifacts
+      - ./configs:/app/configs:ro
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: .
+      dockerfile: docker/frontend/Dockerfile
+    environment:
+      NEXT_PUBLIC_API_URL: http://localhost:8000
+      PORT: 3000
+    ports:
+      - "3000:3000"
+    depends_on:
+      - backend
+    restart: unless-stopped
+
+volumes:
+  pgdata:

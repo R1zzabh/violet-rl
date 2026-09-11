@@ -1,0 +1,89 @@
+# .github/workflows/ci.yml — VIOLET
+
+name: CI
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
+
+jobs:
+  python-checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install package
+        working-directory: ./backend
+        run: pip install -e ".[dev]"
+
+      - name: Lint (ruff)
+        working-directory: ./backend
+        run: ruff check violet tests
+
+      - name: Format check (ruff)
+        working-directory: ./backend
+        run: ruff format --check violet tests
+
+      - name: Typecheck (mypy)
+        working-directory: ./backend
+        run: mypy violet tests
+
+      - name: Security scan (bandit)
+        working-directory: ./backend
+        run: bandit -r violet -ll
+
+      - name: Unit tests
+        working-directory: ./backend
+        run: pytest tests/unit -v
+
+      - name: Integration tests
+        working-directory: ./backend
+        run: pytest tests/integration -v
+
+      - name: Smoke test
+        working-directory: ./backend
+        run: pytest tests/smoke -v
+
+  frontend-checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install dependencies
+        working-directory: ./frontend
+        run: npm ci
+
+      - name: Lint
+        working-directory: ./frontend
+        run: npm run lint
+
+      - name: Typecheck
+        working-directory: ./frontend
+        run: npm run typecheck
+
+      - name: Build
+        working-directory: ./frontend
+        run: npm run build
+
+  docker-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build backend image
+        run: docker build -f docker/backend/Dockerfile -t violet-backend:ci .
+      - name: Build frontend image
+        run: docker build -f docker/frontend/Dockerfile -t violet-frontend:ci ./frontend
