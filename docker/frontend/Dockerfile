@@ -6,7 +6,7 @@ WORKDIR /app
 
 # ---- deps ----
 COPY frontend/package.json frontend/package-lock.json ./
-RUN npm ci --only=production 2>/dev/null || npm ci
+RUN npm ci
 
 # ---- build ----
 COPY frontend .

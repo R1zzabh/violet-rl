@@ -3,16 +3,16 @@
 import pytest
 
 from violet.agents import (
+    ProactiveBlueAgent,
     RandomBlueAgent,
     RandomRedAgent,
+    ReactiveBlueAgent,
     RuleBasedBlueAgent,
     ScriptedAggressiveRedAgent,
-    ScriptedStealthRedAgent,
     ScriptedLateralRedAgent,
-    ScriptedRandomizedRedAgent,
     ScriptedObjectiveRedAgent,
-    ReactiveBlueAgent,
-    ProactiveBlueAgent,
+    ScriptedRandomizedRedAgent,
+    ScriptedStealthRedAgent,
 )
 from violet.env import VIOLETEnv
 from violet.scenarios import v1_enterprise_network
@@ -67,8 +67,10 @@ def test_scripted_aggressive_red_theta__phase_progression(env, obs_and_info):
 
     # advance state: compromise web
     env.network.nodes["web"].attacker_discovered = True
-    env.network.nodes["web"].is_compromised = lambda: True  # type: ignore
-    env.network.nodes["web"].compromise_status = __import__("violet.types", fromlist=["CompromiseStatus"]).CompromiseStatus.COMPROMISED
+    env.network.nodes["web"].is_compromised = lambda: True
+    env.network.nodes["web"].compromise_status = __import__(
+        "violet.types", fromlist=["CompromiseStatus"]
+    ).CompromiseStatus.COMPROMISED
     env.network.nodes["web"].attacker_knows_vulnerabilities = True
 
     action2 = agent.select_action(env, info.get(ATTACKER_AGENT, {}))
@@ -76,9 +78,12 @@ def test_scripted_aggressive_red_theta__phase_progression(env, obs_and_info):
 
 
 def test_scripted_aggressive_red_walks_topology_inward(env, obs_and_info):
-    """Regression: aggressive red must progress from its entry point along the
-    topology (web -> app -> database), never attacking the objective directly
-    before reaching a foothold adjacent to it."""
+    """Regression: aggressive red walks the topology inward.
+
+    It must progress from its entry point along the topology
+    (web -> app -> database), never attacking the objective directly before
+    reaching a foothold adjacent to it.
+    """
     obs, info = obs_and_info
     agent = ScriptedAggressiveRedAgent(target_node_id="database")
     agent.reset()
@@ -96,7 +101,9 @@ def test_scripted_stealth_red_picks_wait_when_alert(env, obs_and_info):
     obs, info = obs_and_info
     agent = ScriptedStealthRedAgent(target_node_id="database")
     env.network.nodes["web"].attacker_discovered = True
-    env.network.nodes["web"].alert_level = __import__("violet.types", fromlist=["AlertLevel"]).AlertLevel.HIGH
+    env.network.nodes["web"].alert_level = __import__(
+        "violet.types", fromlist=["AlertLevel"]
+    ).AlertLevel.HIGH
     action = agent.select_action(env, info.get(ATTACKER_AGENT, {}))
     space = env.action_space(ATTACKER_AGENT)
     assert 0 <= action < space.n
@@ -130,8 +137,12 @@ def test_rule_based_blue_isolate_compromised(env, obs_and_info):
     obs, info = obs_and_info
     agent = RuleBasedBlueAgent()
     # Simulate a compromised node
-    env.network.nodes["web"].compromise_status = __import__("violet.types", fromlist=["CompromiseStatus"]).CompromiseStatus.COMPROMISED
-    env.network.nodes["web"].isolated = __import__("violet.types", fromlist=["IsolationStatus"]).IsolationStatus.CONNECTED
+    env.network.nodes["web"].compromise_status = __import__(
+        "violet.types", fromlist=["CompromiseStatus"]
+    ).CompromiseStatus.COMPROMISED
+    env.network.nodes["web"].isolated = __import__(
+        "violet.types", fromlist=["IsolationStatus"]
+    ).IsolationStatus.CONNECTED
     action = agent.select_action(env, info.get(DEFENDER_AGENT, {}))
     space = env.action_space(DEFENDER_AGENT)
     assert 0 <= action < space.n
@@ -149,7 +160,7 @@ def test_proactive_blue_patches_high_vuln(env, obs_and_info):
     obs, info = obs_and_info
     agent = ProactiveBlueAgent()
     env.network.nodes["web"].vulnerability_rate = 0.9
-    env.network.nodes["web"].is_critical_asset = False  # type: ignore
+    env.network.nodes["web"].is_critical_asset = False
     action = agent.select_action(env, info.get(DEFENDER_AGENT, {}))
     space = env.action_space(DEFENDER_AGENT)
     assert 0 <= action < space.n

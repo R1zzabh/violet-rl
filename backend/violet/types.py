@@ -6,7 +6,6 @@ import enum
 from dataclasses import dataclass, field
 from typing import Any
 
-
 # ---------------------------------------------------------------------------
 # Agent identifiers
 # ---------------------------------------------------------------------------
@@ -14,6 +13,7 @@ ATTACKER_AGENT = "red"
 DEFENDER_AGENT = "blue"
 
 AGENT_NAMES = (ATTACKER_AGENT, DEFENDER_AGENT)
+
 
 # ---------------------------------------------------------------------------
 # Action type enums

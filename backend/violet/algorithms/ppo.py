@@ -13,13 +13,12 @@
 
 from __future__ import annotations
 
-import copy
 import json
 import random
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import torch
@@ -27,8 +26,10 @@ import torch.nn as nn
 from torch.distributions import Categorical
 
 from violet.agents.rl import RLCheckpoint
-from violet.env import VIOLETEnv
 from violet.types import ATTACKER_AGENT, DEFENDER_AGENT
+
+if TYPE_CHECKING:
+    from violet.env import VIOLETEnv
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -56,7 +57,7 @@ class ActorCritic(nn.Module):
         nn.init.orthogonal_(self.policy_head.weight, gain=0.01)
         nn.init.zeros_(self.policy_head.bias)
 
-    def forward(self, obs: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, obs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         h = self.trunk(obs)
         return self.policy_head(h), self.value_head(h).squeeze(-1)
 
@@ -88,7 +89,7 @@ class ActorCritic(nn.Module):
                 raise ValueError("action_mask disallowed every action — env mask bug")
             if deterministic:
                 return int(torch.argmax(logits, dim=-1).item())
-            return int(Categorical(logits=logits).sample().item())
+            return int(Categorical(logits=logits).sample().item())  # type: ignore[no-untyped-call]
 
 
 # ---------------------------------------------------------------------------
@@ -106,13 +107,13 @@ class Transition:
 
 
 def compute_gae(
-    rewards: List[float],
-    values: List[float],
-    dones: List[bool],
+    rewards: list[float],
+    values: list[float],
+    dones: list[bool],
     next_value: float,
     gamma: float,
     gae_lambda: float,
-) -> Tuple[np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray]:
     """Generalized Advantage Estimation over one trajectory.
 
     A dones[i]=True cuts the bootstrapping: the next value is not propagated
@@ -137,9 +138,9 @@ def compute_gae(
 # ---------------------------------------------------------------------------
 class RolloutBuffer:
     def __init__(self) -> None:
-        self.transitions: List[Transition] = []
-        self.advantages: Optional[np.ndarray] = None
-        self.returns: Optional[np.ndarray] = None
+        self.transitions: list[Transition] = []
+        self.advantages: np.ndarray | None = None
+        self.returns: np.ndarray | None = None
 
     def add(self, t: Transition) -> None:
         self.transitions.append(t)
@@ -162,14 +163,24 @@ class RolloutBuffer:
         self.advantages = None
         self.returns = None
 
-    def tensors(self, device: torch.device) -> Dict[str, torch.Tensor]:
+    def tensors(self, device: torch.device) -> dict[str, torch.Tensor]:
         assert self.advantages is not None and self.returns is not None
         return {
-            "obs": torch.as_tensor(np.stack([t.obs for t in self.transitions]), dtype=torch.float32, device=device),
-            "mask": torch.as_tensor(np.stack([t.mask for t in self.transitions]), dtype=torch.bool, device=device),
-            "actions": torch.as_tensor([t.action for t in self.transitions], dtype=torch.long, device=device),
-            "old_log_probs": torch.as_tensor([t.log_prob for t in self.transitions], dtype=torch.float32, device=device),
-            "old_values": torch.as_tensor([t.value for t in self.transitions], dtype=torch.float32, device=device),
+            "obs": torch.as_tensor(
+                np.stack([t.obs for t in self.transitions]), dtype=torch.float32, device=device
+            ),
+            "mask": torch.as_tensor(
+                np.stack([t.mask for t in self.transitions]), dtype=torch.bool, device=device
+            ),
+            "actions": torch.as_tensor(
+                [t.action for t in self.transitions], dtype=torch.long, device=device
+            ),
+            "old_log_probs": torch.as_tensor(
+                [t.log_prob for t in self.transitions], dtype=torch.float32, device=device
+            ),
+            "old_values": torch.as_tensor(
+                [t.value for t in self.transitions], dtype=torch.float32, device=device
+            ),
             "advantages": torch.as_tensor(self.advantages, dtype=torch.float32, device=device),
             "returns": torch.as_tensor(self.returns, dtype=torch.float32, device=device),
         }
@@ -181,7 +192,7 @@ class RolloutBuffer:
 @dataclass
 class PPOConfig:
     # rollout
-    rollout_steps: int = 512          # env steps collected per PPO update
+    rollout_steps: int = 512  # env steps collected per PPO update
     # optimization
     gamma: float = 0.99
     gae_lambda: float = 0.95
@@ -197,10 +208,10 @@ class PPOConfig:
     # bookkeeping
     seed: int = 42
     max_updates: int = 50
-    checkpoint_interval: int = 10     # updates between periodic checkpoints
+    checkpoint_interval: int = 10  # updates between periodic checkpoints
     run_dir: str = "runs/ppo_red_v1"
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         return dict(self.__dict__)
 
 
@@ -235,11 +246,11 @@ class PPOTrainer:
         self.optimizer = torch.optim.Adam(self.model.parameters(), lr=config.lr)
 
         self.buffer = RolloutBuffer()
-        self.global_step = 0          # env steps since the very first start (survives resume)
-        self.update_idx = 0           # PPO updates completed
+        self.global_step = 0  # env steps since the very first start (survives resume)
+        self.update_idx = 0  # PPO updates completed
 
         # metrics history: list of dicts, one per update
-        self.update_log: List[Dict[str, Any]] = []
+        self.update_log: list[dict[str, Any]] = []
 
         run_dir = Path(config.run_dir)
         (run_dir / "checkpoints").mkdir(parents=True, exist_ok=True)
@@ -256,14 +267,14 @@ class PPOTrainer:
         return (self.config.seed * 1_000_003 + self.global_step) % (2**31)
 
     # -- rollout ------------------------------------------------------------
-    def collect_rollout(self) -> Tuple[List[Dict[str, Any]], float]:
+    def collect_rollout(self) -> tuple[list[dict[str, Any]], float]:
         """Run the env until rollout_steps transitions are collected.
 
         The env's step counter persists across reset() calls inside a rollout;
         termination restarts episodes automatically. Returns episode summaries
         and the mean episode reward observed.
         """
-        episodes: List[Dict[str, Any]] = []
+        episodes: list[dict[str, Any]] = []
         ep_reward = 0.0
         ep_len = 0
         step_rng_state = None
@@ -282,8 +293,8 @@ class PPOTrainer:
                     ~torch.as_tensor(mask, device=DEVICE).unsqueeze(0), float("-inf")
                 )
                 dist = Categorical(logits=logits)
-                action = dist.sample()
-                log_prob = dist.log_prob(action)
+                action = dist.sample()  # type: ignore[no-untyped-call]
+                log_prob = dist.log_prob(action)  # type: ignore[no-untyped-call]
 
             # Frozen opponent acts from ITS OWN view of the env (no policy gradient
             # flows through blue; its outputs are treated as environment dynamics).
@@ -348,7 +359,7 @@ class PPOTrainer:
         return episodes, mean_ep_reward
 
     # -- PPO update ----------------------------------------------------------
-    def update(self, extra_metrics: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    def update(self, extra_metrics: dict[str, Any] | None = None) -> dict[str, Any]:
         batch = self.buffer.tensors(DEVICE)
         n = batch["obs"].shape[0]
 
@@ -357,7 +368,7 @@ class PPOTrainer:
             logits, _ = self.model.forward(batch["obs"])
             logits = logits.masked_fill(~batch["mask"], float("-inf"))
             old_dist = Categorical(logits=logits)
-            old_log_probs = old_dist.log_prob(batch["actions"])
+            old_log_probs = old_dist.log_prob(batch["actions"])  # type: ignore[no-untyped-call]
 
         ratio0 = torch.exp(old_log_probs - batch["old_log_probs"])
 
@@ -366,7 +377,7 @@ class PPOTrainer:
         }
 
         idx = np.arange(n)
-        epoch_stats: List[Dict[str, float]] = []
+        epoch_stats: list[dict[str, float]] = []
         for _ in range(self.config.epochs_per_update):
             np.random.shuffle(idx)
             for start in range(0, n, self.config.minibatch_size):
@@ -376,18 +387,25 @@ class PPOTrainer:
                 logits, values = self.model.forward(mb_t["obs"])
                 logits = logits.masked_fill(~mb_t["mask"], float("-inf"))
                 dist = Categorical(logits=logits)
-                new_log_probs = dist.log_prob(mb_t["actions"])
-                entropy = dist.entropy().mean()
+                new_log_probs = dist.log_prob(mb_t["actions"])  # type: ignore[no-untyped-call]
+                entropy = dist.entropy().mean()  # type: ignore[no-untyped-call]
 
                 ratio = torch.exp(new_log_probs - mb_t["old_log_probs"])
                 advantages = mb_t["advantages"]
                 surr1 = ratio * advantages
-                surr2 = torch.clamp(ratio, 1 - self.config.clip_eps, 1 + self.config.clip_eps) * advantages
+                surr2 = (
+                    torch.clamp(ratio, 1 - self.config.clip_eps, 1 + self.config.clip_eps)
+                    * advantages
+                )
                 policy_loss = -torch.min(surr1, surr2).mean()
 
                 value_loss = nn.functional.mse_loss(values, mb_t["returns"])
 
-                loss = policy_loss + self.config.value_coef * value_loss - self.config.entropy_coef * entropy
+                loss = (
+                    policy_loss
+                    + self.config.value_coef * value_loss
+                    - self.config.entropy_coef * entropy
+                )
 
                 self.optimizer.zero_grad()
                 loss.backward()
@@ -406,7 +424,9 @@ class PPOTrainer:
                     }
                 )
 
-        mean = lambda k: float(np.mean([s[k] for s in epoch_stats]))
+        def mean(k: str) -> float:
+            return float(np.mean([s[k] for s in epoch_stats]))
+
         self.update_idx += 1
         # On-policy: the batch is consumed by this update and must not leak
         # into the next rollout (a stale buffer would make collect_rollout a
@@ -431,7 +451,7 @@ class PPOTrainer:
         self._append_metrics_jsonl(result)
         return result
 
-    def _append_metrics_jsonl(self, record: Dict[str, Any]) -> None:
+    def _append_metrics_jsonl(self, record: dict[str, Any]) -> None:
         path = Path(self.config.run_dir) / "metrics" / "training.jsonl"
         with open(path, "a") as f:
             f.write(json.dumps(record) + "\n")
@@ -463,7 +483,8 @@ class PPOTrainer:
         return str(ckpt_dir)
 
     def load_checkpoint(self, ckpt_dir: str) -> None:
-        payload = torch.load(Path(ckpt_dir) / "model.pt", map_location=DEVICE, weights_only=False)
+        # Loading VIOLET's own training artifacts (local, not user-supplied).
+        payload = torch.load(Path(ckpt_dir) / "model.pt", map_location=DEVICE, weights_only=False)  # nosec B614
         self.model.load_state_dict(payload["model_state_dict"])
         self.optimizer.load_state_dict(payload["optimizer_state_dict"])
         self.global_step = int(payload["global_step"])
@@ -474,7 +495,7 @@ class PPOTrainer:
                 setattr(self.config, k, v)
 
     # -- main loop ---------------------------------------------------------------
-    def train(self) -> Dict[str, Any]:
+    def train(self) -> dict[str, Any]:
         """Run the full training loop; returns a summary dict."""
         best_reward = -float("inf")
         for _ in range(self.config.max_updates):

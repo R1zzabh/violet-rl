@@ -1,7 +1,7 @@
 # tests/unit/test_network.py — VIOLET
 
 from violet.network import Network, Node
-from violet.types import AlertLevel, CompromiseStatus, IsolationStatus
+from violet.types import CompromiseStatus, IsolationStatus
 
 
 def test_node_defaults():

@@ -1,100 +1,116 @@
-# VIOLET — Multi-Agent RL Cyber Attack & Defense Simulator
+# VIOLET
 
-🟣 **VIOLET** (Versatile Intelligent Opponent Learning for Evolving Threats) is a
-**simulated cyber network** modeled as a Partially Observable Markov Game, where
-autonomous attacker and defender agents learn sequential strategies through
-competitive multi-agent reinforcement learning.
+VIOLET is a research project for measuring attacker and defender strategies. It
+now has two separate execution modes: the existing graph simulator and a local
+HTTP training range called Violet Ledger.
 
-## What it is (and isn't)
+## Current implementation
 
-**It IS:**
-- A Markov game simulator with scripted and learnable Red/Blue agents
-- A research platform for measuring whether RL produces better cyber strategies than baselines
-- An evidence-based system: every "learned behavior" claim is backed by measured trajectories
+| Area | State |
+|---|---|
+| Graph simulator | Existing PettingZoo-style simulator with scripted policies and a custom PPO trainer. Its nodes and actions remain simulated. |
+| Violet Ledger | A real FastAPI process with synthetic Alice/Bob accounts and documents in a separate target database. The initial exercise is authenticated IDOR. |
+| HTTP executor | A separate container accepts typed route, login, document-access, and health actions. Its destination and routes are fixed in code. |
+| Blue controls | Typed reset, ownership-hardening, actor block, and rate-limit commands reach the target through a volume queue. Ownership hardening can be verified and persisted only after Alice is denied and Bob remains served. |
+| VIOLET event storage | Range runs, episodes, typed job/control outboxes, target evidence, and hash-linked events are stored in PostgreSQL. `GET /range/runs/{run_id}/events?after_seq=N` replays the committed timeline; `scripts/export_range_run.py` writes a redacted JSONL bundle with checksums. The initial schema is created on API startup; Alembic migrations are not implemented. |
+| Range learning | Red/Blue PPO training is not connected to Violet Ledger. No learning or improvement claim is made for the real range. |
+| Dashboard | Existing pages still show the simulator. The real-range path is currently exercised through the API and smoke script. |
 
-**It is NOT:**
-- A real hacker AI
-- A system that attacks external networks
-- A tool for real exploitation
+The local range sends HTTP requests to the Violet Ledger container only. It does
+not accept arbitrary hosts, URLs, ports, paths, request bodies, shell commands,
+or external callbacks. The executor and target use internal Docker networks;
+UI and API ports bind to loopback, and databases have no published ports. This
+Docker engine does not publish ports from an `internal: true` bridge, so Compose
+uses a separate no-masquerade bridge for the loopback UI/API ports. The
+executor and target are not attached to that bridge.
 
-All activity happens inside the simulated environment. No real malware. No real targets.
+## Start the local stack
 
-## Three-phase roadmap
-
-| Phase | Red | Blue | Goal |
-|-------|-----|------|------|
-| 1 | Scripted (fixed strategies) | PPO (learning) | Verify environment, training loop, baselines |
-| 2 | Multiple scripted strategies | PPO (trained across strategies) | Generalization, cross-strategy evaluation |
-| 3 | PPO (learning) | PPO (learning) | Self-play, non-stationarity, cross-play matrix |
-
-## Stack
-
-- **AI/RL:** Python, PyTorch, PettingZoo (ParallelEnv), Ray RLlib (PPO)
-- **Backend:** FastAPI, Pydantic, SQLAlchemy, PostgreSQL, WebSockets
-- **Frontend:** Next.js 16, TypeScript, Tailwind CSS, shadcn/ui, Recharts, Lucide
-- **Theme:** Neo-Brutalism (black borders, zero-radius, heavy shadows, DM Sans + Space Mono)
-
-## Quick start
+Docker Compose requires separate, non-empty passwords for the two databases.
+Copy the example and set each value to a distinct random alphanumeric string:
 
 ```bash
-# Clone
-git clone <repo> && cd violet
-
-# Full stack (backend + frontend + postgres)
-docker compose up
-
-# Or develop locally
-pip install -e ".[dev]"
-npm install
-npm run dev
+cp .env.example .env
 ```
 
-Open the dashboard at the frontend URL. The `/dashboard` shows the latest stored experiment.
+Then start the stack:
 
-## Project structure
-
-```
-violet/
-├── backend/                 # Python package
-│   └── violet/
-│       ├── env/            # PettingZoo environment, network, nodes, transitions
-│       ├── agents/         # Red/Blue agents, baselines, RL wrappers
-│       ├── rewards/        # Configurable reward engine
-│       ├── scenarios/      # Network topologies
-│       ├── training/       # Training loops, checkpoints
-│       ├── evaluation/     # Independent evaluation
-│       ├── analytics/      # Behavior discovery, metrics
-│       ├── api/            # FastAPI + WebSocket
-│       └── experiments/    # Experiment runner
-├── frontend/               # Next.js dashboard
-├── configs/                # YAML configs (phase1/2/3, rewards, training)
-├── experiments/            # Run outputs
-├── artifacts/              # Checkpoints, metrics, evaluations
-├── docker/                 # Dockerfiles
-└── README.md
+```bash
+docker compose up --build
 ```
 
-## Status
+The dashboard is at [http://127.0.0.1:3000](http://127.0.0.1:3000), the API is
+at [http://127.0.0.1:8000](http://127.0.0.1:8000), and the Violet Ledger target
+is reachable only from the executor on the internal range network. Its health
+check is available through `GET /range/health`.
 
-| Component | Status |
-|-----------|--------|
-| Repository bootstrap | Implemented |
-| Cyber simulator core | In development |
-| Red mechanics | Not started |
-| Blue mechanics | Not started |
-| Environment tests | Not started |
-| Phase 1 RL (PPO Blue vs scripted Red) | Not started |
-| Dashboard V1 | Not started |
-| Phase 2 (multiple Red strategies) | Not started |
-| Phase 3 (RL Red vs RL Blue, self-play) | Not started |
-| Deployment | Not started |
+The VIOLET database has its own volume for range run and event records; the
+simulator's existing metrics and checkpoints remain file-backed. The target
+database stores only disposable synthetic target data. `POST /range/reset`
+re-seeds target records, clears sessions and controls, and leaves VIOLET run
+and event records alone.
 
-## Documentation
+## Run the real-target acceptance slice
 
-See `docs/` for architecture, environment, agents, rewards, training, evaluation, experiments.
+Install the backend's API and development extras, then run the Compose-backed
+smoke script from the backend directory:
 
-## Rules
+```bash
+cd backend
+pip install -e ".[api,dev]"
+python scripts/range_smoke.py
+```
 
-- Never fabricate results, learning curves, or benchmark numbers.
-- Every reported metric has a reproducible source.
-- Phase N+1 only starts after Phase N passes its tests, baselines, and reproducibility checks.
+The script resets fixtures with seed 17, logs in as Alice using a synthetic
+credential reference, requests Bob's document through the executor, and
+requires the independent verifier to match the seeded Bob canary. It then
+applies ownership hardening and checks that Alice receives HTTP 403 while Bob
+still receives HTTP 200. It submits those requests to the control verifier and
+checks the persisted event sequence, evidence correlation, hash links, and an
+`after_seq` replay.
+
+Focused local tests are:
+
+```bash
+pytest tests/unit/test_range_contracts.py -q
+pytest tests/unit/test_control_verifier.py -q
+pytest tests/integration/test_real_target.py -q
+pytest tests/integration/test_persistence_replay.py -q
+```
+
+Range runs, events, job results, and control acknowledgements are persisted in
+PostgreSQL before they are returned by the API. Target access evidence is
+stored in the `target-evidence` Docker volume, mounted read-only into the API,
+and imported into the event timeline when a result is read or replayed.
+Executor jobs/results and target control messages use separate named volumes;
+the database outbox is reconciled into those queues after API restart. The
+initial SQLAlchemy schema is created at startup rather than managed by
+Alembic. The exporter checks the source event hash chain before writing a
+redacted JSONL timeline and SHA-256 manifest. There is not yet a frontend
+replay view or a complete typed decision/reward record.
+
+## Simulator training
+
+The graph simulator and its existing training flow remain separate from the
+real HTTP range. Install the `rl` extra for PyTorch and follow the commands in
+`backend/README.md`. Simulator rewards and saved evaluations must not be
+presented as real-target results.
+
+## Repository map
+
+- `backend/violet/env.py`, `network.py`, and `transition.py`: graph simulator.
+- `backend/violet/algorithms/ppo.py`: current simulator PPO implementation.
+- `backend/violet/range/`: versioned actions, executor, verifier, and spool.
+- `backend/violet/persistence/`: SQLAlchemy event store, replay, and export.
+- `backend/violet/target_app/`: Violet Ledger, synthetic database, controls, and telemetry.
+- `backend/violet/api/`: simulator API and local range endpoints.
+- `docker-compose.yml`, `docker/target/`, and `docker/executor/`: local isolation boundary.
+- `backend/tests/`: simulator and real-target tests.
+- `backend/docs/development_log.md`: dated implementation history and measured results.
+
+## Remaining milestones
+
+The remaining work includes Alembic migration management, role-specific Blue
+observations, evidence-derived role rewards, real-range PPO, and held-out
+co-evolution evaluation. Violet Ledger results remain descriptive until the
+learning and evaluation milestones have passed.

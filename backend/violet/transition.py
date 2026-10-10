@@ -5,22 +5,21 @@ from __future__ import annotations
 import random
 import time
 from dataclasses import dataclass, field
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-from violet.network import Network
-from violet.rewards import RewardEngine
 from violet.types import (
     Action,
-    ActionTarget,
     AlertLevel,
-    ATTACKER_AGENT,
     BlueActionType,
     CompromiseStatus,
-    DEFENDER_AGENT,
     IsolationStatus,
     RedActionType,
     ServiceStatus,
 )
+
+if TYPE_CHECKING:
+    from violet.network import Network
+    from violet.rewards import RewardEngine
 
 
 def _die_roll(rate: float, rng: random.Random) -> bool:
@@ -260,12 +259,15 @@ class TransitionEngine:
         source must be a DIRECTLY ADJACENT compromised foothold (an actual one-hop
         lateral movement). Multi-hop "movement" in a single action is rejected —
         the attacker must compromise each intermediate hop. No random destination
-        or random source selection remains."""
+        or random source selection remains.
+        """
         destination_id = node.id
 
         if node.is_compromised():
             context.result = "lateral_failed"
-            self._emit_event(context, action, "lateral_failed", f"{destination_id} already compromised")
+            self._emit_event(
+                context, action, "lateral_failed", f"{destination_id} already compromised"
+            )
             return context
 
         if node.is_honeypot:
@@ -289,7 +291,8 @@ class TransitionEngine:
             return context
 
         adjacent = list(destination_node.connections) + [
-            nid for nid in destination_node.incoming_connections
+            nid
+            for nid in destination_node.incoming_connections
             if nid not in destination_node.connections
         ]
         sources = [
@@ -364,7 +367,9 @@ class TransitionEngine:
             self._emit_event(context, action, "exfiltration_success", f"exfiltrated {node.id}")
         else:
             context.result = "exfiltration_failed"
-            self._emit_event(context, action, "exfiltration_failed", f"exfiltration failed {node.id}")
+            self._emit_event(
+                context, action, "exfiltration_failed", f"exfiltration failed {node.id}"
+            )
 
         return context
 
@@ -430,7 +435,7 @@ class TransitionEngine:
         context: TransitionContext,
         rng: random.Random,
     ) -> TransitionContext:
-        """Monitoring can detect compromise with some probability.
+        """Monitor the node; compromise is detected with some probability.
 
         Detection-reward semantics: `attack_detected` fires only on the FIRST
         detection of this node's compromise (defender_aware_of_compromise flag).
@@ -448,15 +453,21 @@ class TransitionEngine:
                 context.detected = True
                 context.attack_detected = True
                 context.result = "monitor_detected"
-                self._emit_event(context, action, "monitor_detected", f"detected compromise on {node.id}")
+                self._emit_event(
+                    context, action, "monitor_detected", f"detected compromise on {node.id}"
+                )
             elif not node.is_compromised():
                 # False positive: alert raised, but no detection reward
                 context.false_positive = True
                 context.result = "monitor_false_positive"
-                self._emit_event(context, action, "monitor_false_positive", f"false alarm on {node.id}")
+                self._emit_event(
+                    context, action, "monitor_false_positive", f"false alarm on {node.id}"
+                )
             else:
                 context.result = "monitor_repeat_detect"
-                self._emit_event(context, action, "monitor_repeat_detect", f"{node.id} compromise already known")
+                self._emit_event(
+                    context, action, "monitor_repeat_detect", f"{node.id} compromise already known"
+                )
         else:
             context.result = "monitor_no_detect"
             self._emit_event(context, action, "monitor_no_detect", f"no activity on {node.id}")
@@ -613,10 +624,14 @@ class TransitionEngine:
             node.vulnerability_rate = 0.9
             node.attacker_knows_vulnerabilities = False
             context.result = "honeypot_deployed"
-            self._emit_event(context, action, "honeypot_deployed", f"deployed honeypot on {node.id}")
+            self._emit_event(
+                context, action, "honeypot_deployed", f"deployed honeypot on {node.id}"
+            )
         else:
             context.result = "honeypot_failed"
-            self._emit_event(context, action, "honeypot_failed", f"honeypot deployment failed on {node.id}")
+            self._emit_event(
+                context, action, "honeypot_failed", f"honeypot deployment failed on {node.id}"
+            )
         return context
 
     def _blue_restore(
@@ -681,12 +696,14 @@ class TransitionEngine:
     # Termination check
     # ------------------------------------------------------------------
     def should_terminate(self) -> bool:
-        """Episode terminates when a critical asset is compromised (Red wins) or the
-        attacker is removed/reset from all compromised nodes and no active compromise
-        remains. Phase 1 starts simple: critical-asset compromise = terminal."""
+        """Determine whether the episode should terminate.
+
+        Phase 1 keeps termination simple: critical-asset compromise is terminal
+        (Red wins). Truncation at the cycle limit is handled by the environment.
+        """
         # Terminal condition A: critical asset compromised
-        if self.network.critical_assets_compromised() > 0:
-            return True
-        # Terminal condition B: Red has no foothold (all compromises cleared) — optional
-        # for simplicity we also allow max step truncation externally.
+        # Terminal condition A: critical asset compromised. (Condition B — red
+        # loses all footholds — is intentionally not terminal in Phase 1;
+        # truncation is handled by the cycle limit instead.)
+        return self.network.critical_assets_compromised() > 0
         return False

@@ -9,7 +9,6 @@ from typing import Any
 from violet.types import (
     AlertLevel,
     CompromiseStatus,
-    Direction,
     IsolationStatus,
     ServiceStatus,
 )
@@ -90,8 +89,8 @@ class Node:
             CompromiseStatus.EXFILTRATED,
         )
 
-    def can_reach(self, other_id: str, network: "Network") -> bool:
-        """Can this node reach *other_id* given isolation and connectivity?"""
+    def can_reach(self, other_id: str, network: Network) -> bool:
+        """Return whether this node can reach *other_id* (isolation-aware)."""
         if self.isolated == IsolationStatus.ISOLATED:
             return False
         if other_id == self.id:
@@ -100,9 +99,7 @@ class Node:
             target = network.nodes.get(other_id)
             if target is None:
                 return False
-            if target.isolated == IsolationStatus.ISOLATED:
-                return False
-            return True
+            return target.isolated != IsolationStatus.ISOLATED
         # indirect reachability (multi-hop) — used for lateral movement
         return network._is_reachable(self.id, other_id, visited=set())
 
@@ -158,7 +155,7 @@ class Network:
         self.nodes[source].connections.append(target)
         self.nodes[target].incoming_connections.append(source)
 
-    def clone(self) -> "Network":
+    def clone(self) -> Network:
         """Deep clone for reset / determinism."""
         return copy.deepcopy(self)
 
@@ -171,13 +168,10 @@ class Network:
         node = self.nodes.get(src)
         if node is None or node.isolated == IsolationStatus.ISOLATED:
             return False
-        for nid in node.connections:
-            if self._is_reachable(nid, dst, visited):
-                return True
-        return False
+        return any(self._is_reachable(nid, dst, visited) for nid in node.connections)
 
     def reachable_from(self, src: str) -> set[str]:
-        """Set of node IDs reachable from *src* (excluding isolated targets)."""
+        """Return the set of node IDs reachable from *src* (excluding isolated targets)."""
         reachable: set[str] = set()
         stack = [src]
         visited: set[str] = set()
@@ -206,11 +200,7 @@ class Network:
         return sum(1 for n in self.nodes.values() if n.is_compromised())
 
     def critical_assets_compromised(self) -> int:
-        return sum(
-            1
-            for n in self.nodes.values()
-            if n.is_critical_asset and n.is_compromised()
-        )
+        return sum(1 for n in self.nodes.values() if n.is_critical_asset and n.is_compromised())
 
     def total_value(self) -> float:
         return sum(n.value for n in self.nodes.values())

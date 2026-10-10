@@ -3,33 +3,37 @@
 from __future__ import annotations
 
 import random
-from typing import Any, Dict, List
+from typing import TYPE_CHECKING, Any
 
-from violet.env import VIOLETEnv
+from violet.agents.base import Agent
 from violet.types import DEFENDER_AGENT, BlueActionType
 
+if TYPE_CHECKING:
+    from violet.env import VIOLETEnv
 
-class BlueAgent:
-    """Base class for blue agents that returns a discrete action index suitable for
-    the environment's blue action space."""
+
+class BlueAgent(Agent):
+    """Base class for blue agents returning a discrete action index.
+
+    The index targets the environment's blue action space.
+    """
 
     agent_name = DEFENDER_AGENT
 
-    def select_action(self, env: VIOLETEnv, info: Dict[str, Any]) -> int:
+    def select_action(self, env: VIOLETEnv, info: dict[str, Any]) -> int:
         raise NotImplementedError
 
-    def reset(self) -> None:
-        ...
+    def reset(self) -> None: ...
 
 
 class RandomBlueAgent(BlueAgent):
     """Uniformly random defender — baseline 1 (per spec)."""
 
-    def select_action(self, env: VIOLETEnv, info: Dict[str, Any]) -> int:
+    def select_action(self, env: VIOLETEnv, info: dict[str, Any]) -> int:
         action_space = env.action_space(DEFENDER_AGENT)
         if env.rng is not None:
-            return env.rng.randint(0, action_space.n - 1)
-        return random.randint(0, action_space.n - 1)
+            return int(env.rng.randint(0, action_space.n - 1))
+        return int(random.randint(0, action_space.n - 1))
 
 
 class RuleBasedBlueAgent(BlueAgent):
@@ -42,7 +46,7 @@ class RuleBasedBlueAgent(BlueAgent):
         - Otherwise → WAIT
     """
 
-    def select_action(self, env: VIOLETEnv, info: Dict[str, Any]) -> int:
+    def select_action(self, env: VIOLETEnv, info: dict[str, Any]) -> int:
         if env.network is None:
             raise RuntimeError("Environment not initialized")
         node_ids = list(env.network.nodes.keys())
@@ -74,11 +78,14 @@ class RuleBasedBlueAgent(BlueAgent):
         # Priority 4: patch nodes with moderate vulnerability and no alert
         for nid in node_ids:
             node = env.network.nodes[nid]
-            if not node.is_compromised() and node.alert_level.value == "none":
-                if node.vulnerability_rate > 0.5:
-                    target_idx = node_ids.index(nid)
-                    type_idx = list(BlueActionType).index(BlueActionType.PATCH)
-                    return target_idx * len(BlueActionType) + type_idx
+            if (
+                not node.is_compromised()
+                and node.alert_level.value == "none"
+                and node.vulnerability_rate > 0.5
+            ):
+                target_idx = node_ids.index(nid)
+                type_idx = list(BlueActionType).index(BlueActionType.PATCH)
+                return target_idx * len(BlueActionType) + type_idx
 
         # Default: monitor the most critical asset
         critical = [nid for nid in node_ids if env.network.nodes[nid].is_critical_asset]
@@ -104,9 +111,10 @@ class ReactiveBlueAgent(BlueAgent):
         self.detection_threshold = detection_threshold
         self.detected_count = 0
 
-    def select_action(self, env: VIOLETEnv, info: Dict[str, Any]) -> int:
+    def select_action(self, env: VIOLETEnv, info: dict[str, Any]) -> int:
         if env.network is None:
             raise RuntimeError("Environment not initialized")
+        assert env.network is not None, "environment not initialized"
         node_ids = list(env.network.nodes.keys())
         compromised_count = sum(1 for n in env.network.nodes.values() if n.is_compromised())
         self.detected_count = compromised_count
@@ -114,9 +122,7 @@ class ReactiveBlueAgent(BlueAgent):
         if compromised_count >= self.detection_threshold:
             # Respond to highest-value compromised node
             compromised_nodes = [
-                (nid, n.value)
-                for nid, n in env.network.nodes.items()
-                if n.is_compromised()
+                (nid, n.value) for nid, n in env.network.nodes.items() if n.is_compromised()
             ]
             compromised_nodes.sort(key=lambda x: -x[1])
             target_id = compromised_nodes[0][0]
@@ -129,7 +135,7 @@ class ReactiveBlueAgent(BlueAgent):
         else:
             # Monitoring phase
             # pick a node with highest vulnerability to monitor
-            target_id = max(node_ids, key=lambda nid: env.network.nodes[nid].vulnerability_rate)
+            target_id = max(node_ids, key=lambda nid: env.network.nodes[nid].vulnerability_rate)  # type: ignore[union-attr]
             target_idx = node_ids.index(target_id)
             type_idx = list(BlueActionType).index(BlueActionType.MONITOR)
             return target_idx * len(BlueActionType) + type_idx
@@ -138,7 +144,7 @@ class ReactiveBlueAgent(BlueAgent):
 class ProactiveBlueAgent(BlueAgent):
     """Proactive blue agent — pre-emptively patches high-vuln nodes and monitors critical assets."""
 
-    def select_action(self, env: VIOLETEnv, info: Dict[str, Any]) -> int:
+    def select_action(self, env: VIOLETEnv, info: dict[str, Any]) -> int:
         if env.network is None:
             raise RuntimeError("Environment not initialized")
         node_ids = list(env.network.nodes.keys())

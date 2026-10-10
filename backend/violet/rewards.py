@@ -54,9 +54,7 @@ class RewardConfig:
     step_penalty: float = -0.1  # small time cost for both
 
     def to_dict(self) -> dict[str, float]:
-        return {
-            k: v for k, v in self.__dict__.items() if isinstance(v, float)
-        }
+        return {k: v for k, v in self.__dict__.items() if isinstance(v, float)}
 
 
 # ---------------------------------------------------------------------------
@@ -156,15 +154,31 @@ class RewardEngine:
     def _red_components(self, context: dict[str, Any]) -> dict[str, float]:
         c = self.config
         return {
-            "recon_success": c.red_recon_success if context.get("result") == "recon_success" else 0.0,
-            "exploit_success": c.red_exploit_success if context.get("result") == "exploit_success" else 0.0,
-            "priv_esc_success": c.red_priv_esc_success if context.get("result") == "priv_esc_success" else 0.0,
-            "lateral_success": c.red_lateral_success if context.get("result") == "lateral_success" else 0.0,
-            "critical_asset_reached": c.red_critical_asset_reached if context.get("new_state_changed") == "critical_asset_compromised" else 0.0,
-            "exfiltration_success": c.red_exfiltration_success if context.get("result") == "exfiltration_success" else 0.0,
-            "exploit_failed": c.red_exploit_failed if context.get("result") == "exploit_failed" else 0.0,
+            "recon_success": c.red_recon_success
+            if context.get("result") == "recon_success"
+            else 0.0,
+            "exploit_success": c.red_exploit_success
+            if context.get("result") == "exploit_success"
+            else 0.0,
+            "priv_esc_success": c.red_priv_esc_success
+            if context.get("result") == "priv_esc_success"
+            else 0.0,
+            "lateral_success": c.red_lateral_success
+            if context.get("result") == "lateral_success"
+            else 0.0,
+            "critical_asset_reached": c.red_critical_asset_reached
+            if context.get("new_state_changed") == "critical_asset_compromised"
+            else 0.0,
+            "exfiltration_success": c.red_exfiltration_success
+            if context.get("result") == "exfiltration_success"
+            else 0.0,
+            "exploit_failed": c.red_exploit_failed
+            if context.get("result") == "exploit_failed"
+            else 0.0,
             "detected": c.red_detected if context.get("detected") else 0.0,
-            "honeypot_triggered": c.red_honeypot_triggered if context.get("honeypot_triggered") else 0.0,
+            "honeypot_triggered": c.red_honeypot_triggered
+            if context.get("honeypot_triggered")
+            else 0.0,
             "terminated": c.red_agent_terminated if context.get("terminated") else 0.0,
             "step_penalty": c.step_penalty,
         }
@@ -175,16 +189,30 @@ class RewardEngine:
             "attack_detected": c.blue_attack_detected if context.get("attack_detected") else 0.0,
             "attack_contained": c.blue_attack_contained if context.get("attack_contained") else 0.0,
             "host_recovered": c.blue_host_recovered if context.get("host_recovered") else 0.0,
-            "critical_asset_protected": c.blue_critical_asset_protected if context.get("critical_asset_protected") else 0.0,
+            "critical_asset_protected": c.blue_critical_asset_protected
+            if context.get("critical_asset_protected")
+            else 0.0,
             "attacker_removed": c.blue_attacker_removed if context.get("attacker_removed") else 0.0,
-            "unnecessary_isolation": c.blue_unnecessary_isolation if context.get("unnecessary_isolation") else 0.0,
-            "unnecessary_patch": c.blue_unnecessary_patch if context.get("unnecessary_patch") else 0.0,
-            "unnecessary_reset": c.blue_unnecessary_reset if context.get("unnecessary_reset") else 0.0,
-            "unnecessary_block": c.blue_unnecessary_block if context.get("unnecessary_block") else 0.0,
-            "unnecessary_restore": c.blue_unnecessary_restore if context.get("unnecessary_restore") else 0.0,
+            "unnecessary_isolation": c.blue_unnecessary_isolation
+            if context.get("unnecessary_isolation")
+            else 0.0,
+            "unnecessary_patch": c.blue_unnecessary_patch
+            if context.get("unnecessary_patch")
+            else 0.0,
+            "unnecessary_reset": c.blue_unnecessary_reset
+            if context.get("unnecessary_reset")
+            else 0.0,
+            "unnecessary_block": c.blue_unnecessary_block
+            if context.get("unnecessary_block")
+            else 0.0,
+            "unnecessary_restore": c.blue_unnecessary_restore
+            if context.get("unnecessary_restore")
+            else 0.0,
             "false_positive": c.blue_false_positive if context.get("false_positive") else 0.0,
             "service_downtime": c.blue_service_downtime if context.get("service_downtime") else 0.0,
-            "critical_asset_compromised": c.blue_critical_asset_compromised if context.get("critical_asset_compromised") else 0.0,
+            "critical_asset_compromised": c.blue_critical_asset_compromised
+            if context.get("critical_asset_compromised")
+            else 0.0,
             "step_penalty": c.step_penalty,
         }
 

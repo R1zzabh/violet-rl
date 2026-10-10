@@ -1,9 +1,12 @@
 # tests/integration/test_environment.py — VIOLET
 
-import pytest
+from typing import Any
 
+from violet.agents import (
+    RuleBasedBlueAgent,
+    ScriptedAggressiveRedAgent,
+)
 from violet.env import VIOLETEnv
-from violet.agents import RandomBlueAgent, RandomRedAgent, RuleBasedBlueAgent, ScriptedAggressiveRedAgent
 from violet.scenarios import v1_enterprise_network
 from violet.types import ATTACKER_AGENT, DEFENDER_AGENT
 
@@ -31,7 +34,7 @@ def test_parallel_env_api_compliance():
         assert space.shape[0] > 0
 
     # step
-    actions = {agent: 0 for agent in env.agents}
+    actions = dict.fromkeys(env.agents, 0)
     next_obs, rewards, terminations, truncations, next_infos = env.step(actions)
     assert set(next_obs.keys()) == set(env.agents)
     assert set(rewards.keys()) == set(env.agents)
@@ -49,7 +52,7 @@ def test_episode_with_scripted_agents_produces_events():
     red.reset()
     blue.reset()
 
-    events_collected: list[dict] = []
+    events_collected: list[dict[str, Any]] = []
     for _ in range(20):
         red_action = red.select_action(env, infos.get(ATTACKER_AGENT, {}))
         blue_action = blue.select_action(env, infos.get(DEFENDER_AGENT, {}))
@@ -115,18 +118,17 @@ def test_blue_rule_based_isolates_compromised_node():
     blue.reset()
 
     web_compromised = False
-    web_isolated = False
     for _ in range(30):
         red_action = red.select_action(env, infos.get(ATTACKER_AGENT, {}))
         blue_action = blue.select_action(env, infos.get(DEFENDER_AGENT, {}))
         actions = {ATTACKER_AGENT: red_action, DEFENDER_AGENT: blue_action}
         obs, rewards, terminations, truncations, infos = env.step(actions)
 
+        assert env.network is not None
         web = env.network.nodes["web"]
         if web.is_compromised():
             web_compromised = True
         if web.is_compromised() and web.isolated.value == "isolated":
-            web_isolated = True
             break
 
         if any(terminations.values()):
@@ -136,4 +138,4 @@ def test_blue_rule_based_isolates_compromised_node():
 
     # With rule-based Blue, isolation should eventually happen
     # (may not happen in a single pass if Blue selects another node first)
-    # We accept either outcome, but web_isolated being True is the expected behavior.
+    # We accept either outcome — no isolation assertion in Phase 1.

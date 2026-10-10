@@ -3,10 +3,9 @@
 from __future__ import annotations
 
 import json
-import os
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any
 
 import numpy as np
 
@@ -25,14 +24,14 @@ class RLCheckpoint:
     reward_config_version: str = "v1"
     observation_version: str = "v1"
     action_space_version: str = "v1"
-    hyperparameters: Dict[str, Any] = field(default_factory=dict)
+    hyperparameters: dict[str, Any] = field(default_factory=dict)
     training_steps: int = 0
     timestamp: str = ""
     git_commit: str = ""
     checkpoint_path: str = ""
-    metrics_summary: Dict[str, Any] = field(default_factory=dict)
+    metrics_summary: dict[str, Any] = field(default_factory=dict)
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         return {
             "run_id": self.run_id,
             "algorithm": self.algorithm,
@@ -51,7 +50,7 @@ class RLCheckpoint:
         }
 
     @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> "RLCheckpoint":
+    def from_dict(cls, data: dict[str, Any]) -> RLCheckpoint:
         return cls(**{k: v for k, v in data.items() if k in cls.__dataclass_fields__})
 
 
@@ -65,11 +64,11 @@ class RLAgent(Agent):
 
     agent_name: str
     role: str
-    checkpoint: Optional[RLCheckpoint] = None
-    _policy: Optional[Any] = None  # torch.nn.Module set at construction/load
-    deterministic: bool = True     # greedy evaluation; set False for stochastic play
+    checkpoint: RLCheckpoint | None = None
+    _policy: Any | None = None  # torch.nn.Module set at construction/load
+    deterministic: bool = True  # greedy evaluation; set False for stochastic play
 
-    def __init__(self, agent_name: str, role: str = "blue", policy: Optional[Any] = None):
+    def __init__(self, agent_name: str, role: str = "blue", policy: Any | None = None):
         self.agent_name = agent_name
         self.role = role
         if policy is not None:
@@ -79,7 +78,7 @@ class RLAgent(Agent):
         policy.eval()
         self._policy = policy
 
-    def select_action(self, env: Any, info: Dict[str, Any]) -> int:
+    def select_action(self, env: Any, info: dict[str, Any]) -> int:
         """Return a masked action index from the loaded policy.
 
         Falls back to random action selection until a policy is loaded (useful
@@ -87,12 +86,12 @@ class RLAgent(Agent):
         """
         if self._policy is None:
             action_space = env.action_space(self.agent_name)
-            return env.rng.randint(0, action_space.n - 1) if env.rng is not None else 0
+            return int(env.rng.randint(0, action_space.n - 1)) if env.rng is not None else 0
         import numpy as np
 
         obs = np.asarray(env.observations[self.agent_name], dtype=np.float32)
         mask = np.asarray(env.action_mask(self.agent_name), dtype=bool)
-        return self._policy.act(obs, mask, deterministic=self.deterministic)
+        return int(self._policy.act(obs, mask, deterministic=self.deterministic))
 
     def load_checkpoint(self, checkpoint_dir: str, env: Any = None) -> bool:
         """Load a checkpoint and its metadata.
@@ -105,7 +104,7 @@ class RLAgent(Agent):
         if not meta_path.exists():
             return False
 
-        with open(meta_path, "r") as f:
+        with open(meta_path) as f:
             data = json.load(f)
         self.checkpoint = RLCheckpoint.from_dict(data)
 
@@ -120,7 +119,10 @@ class RLAgent(Agent):
             obs_dim = int(np.prod(obs_space.shape))
             hidden = int(self.checkpoint.hyperparameters.get("hidden", 64))
             model = ActorCritic(obs_dim, act_space.n, hidden=hidden)
-            payload = torch.load(model_path, map_location="cpu", weights_only=False)
+            # Loading VIOLET's own training artifacts (local, not user-supplied).
+            # weights_only=True cannot restore the optimizer state (pickled
+            # objects), so full unpickling is required here.
+            payload = torch.load(model_path, map_location="cpu", weights_only=False)  # nosec B614
             model.load_state_dict(payload["model_state_dict"])
             self._set_policy(model)
         return True
@@ -129,7 +131,7 @@ class RLAgent(Agent):
         self,
         checkpoint_dir: str,
         metadata: RLCheckpoint,
-        model_bytes: Optional[bytes] = None,
+        model_bytes: bytes | None = None,
     ) -> str:
         """Save a checkpoint + metadata. Returns the checkpoint directory."""
         path = Path(checkpoint_dir)
@@ -161,14 +163,14 @@ class TrainingRunMetadata:
     environment_version: str
     seed: int
     reward_config_version: str
-    network_config: Dict[str, Any] = field(default_factory=dict)
-    hyperparameters: Dict[str, Any] = field(default_factory=dict)
+    network_config: dict[str, Any] = field(default_factory=dict)
+    hyperparameters: dict[str, Any] = field(default_factory=dict)
     max_cycles: int = 100
     created_at: str = ""
     git_commit: str = ""
     status: str = "running"
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         return {
             "run_id": self.run_id,
             "algorithm": self.algorithm,

@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 from violet.network import Network, Node, Service, Vulnerability
-from violet.types import CompromiseStatus, ServiceStatus
+from violet.types import ServiceStatus
 
 
 def v1_enterprise_network() -> Network:
@@ -17,7 +17,6 @@ def v1_enterprise_network() -> Network:
 
     This is deliberately small so we can verify the simulator BEFORE training.
     """
-
     net = Network()
 
     internet = Node(
@@ -114,7 +113,9 @@ def v1_enterprise_network() -> Network:
 
     # Add a service to each host (primarily for Blue observability / defense)
     for node in (web, mail, app, database, employee1, employee2):
-        node.services.append(Service(name=f"{node.id}-primary", status=ServiceStatus.ACTIVE, port=80))
+        node.services.append(
+            Service(name=f"{node.id}-primary", status=ServiceStatus.ACTIVE, port=80)
+        )
 
     nodes = [internet, web, mail, app, database, employee1, employee2]
     for n in nodes:

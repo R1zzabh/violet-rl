@@ -282,3 +282,76 @@ never transcribe numbers without re-running the source.
 ### Next milestone
 - Longer PPO run + reward variant comparison (dense vs security-focused),
   then first dashboard wiring to real artifacts (runs/*/metrics/training.jsonl).
+
+---
+
+## 2026-10-10 — Violet Ledger HTTP range and durable replay slice
+
+**Base revision:** `1a9788b` (`VIOLET recovery baseline`). The checkout already
+contained staged and unstaged simulator and frontend changes; they were
+preserved. No commit was created.
+
+**Scope:** add a local-only instrumented target and an isolated, typed HTTP
+executor, then persist the bounded run timeline and support replay/export. This
+is an acceptance slice, not a real-range learning result.
+
+### Implemented
+- Added Violet Ledger with synthetic Alice/Bob accounts, fixture-seeded
+  documents, a deliberately vulnerable authenticated IDOR route, structured
+  access evidence, and a typed ownership-hardening control.
+- Added a range-only executor container with fixed target DNS/port and routes,
+  session-cookie isolation, action/episode budgets, response excerpt limits,
+  and no database or control-plane network access.
+- Added separate target and VIOLET PostgreSQL services and named volumes. Target
+  reset/control commands use typed volume messages and acknowledgements.
+- Added SQLAlchemy run, episode, job, control, event, and target-evidence
+  records. API job/control submissions commit before queueing; sequence events
+  use a previous-hash chain, and the API reconciles pending outbox records on
+  startup. `GET /range/runs/{run_id}/events?after_seq=N` replays committed data.
+- Added a control-verification endpoint that records a verified outcome only
+  when the ownership control was acknowledged before both requests, Alice's
+  foreign read is denied, and Bob's owner read succeeds. Repeating the same
+  request pair is idempotent.
+- Added a redacted JSONL run exporter. It verifies the database event chain
+  before export and writes a manifest with the exported file's SHA-256.
+- Added a Compose-backed target smoke path that resets seed 17, verifies
+  Alice's access to Bob's canary, hardens ownership, verifies Alice gets 403
+  while Bob gets 200, and checks that the verification event is persisted once.
+- Added a root `.dockerignore` and deterministic frontend `npm ci` build step;
+  generated dependencies and build results no longer enter Docker build context.
+
+### Verified
+- Full backend suite on current workspace source inside the isolated backend
+  image: `pytest -p no:cacheprovider tests -q` → **86 passed**.
+- Ruff check and format check over range, target, API, persistence, export, and
+  focused tests → **passed**.
+- Compose smoke, seed 17: confirmed IDOR canary, then Alice `403` and Bob `200`;
+  persisted **22** events with contiguous sequence numbers and linked hashes;
+  duplicate control verification created no duplicate event.
+- Restarted the API and replayed run `82a0b4d4-5a5a-4794-8d24-efe4579c9ec5`:
+  **22 events**, seq 1–22, including its `verified` control outcome.
+- Exported that run to `/tmp/violet-range-export-verify/`; checked event count
+  22, manifest SHA-256, inclusion of the control outcome, and redacted session
+  handle in exported JSONL.
+- Frontend Docker build completed with TypeScript and production compilation;
+  generated-file ignore rules reduced sent build context from about 920 MB to
+  3.04 KB.
+
+### Remaining limitations
+1. SQLAlchemy currently bootstraps tables with `create_all()`; Alembic
+   migrations and append-only database permissions are not implemented.
+2. The real-range timeline persists actions, executor results, control
+   acknowledgements, and target access evidence. It does not yet persist
+   role-specific observations/decisions, detections, reward decomposition, or
+   PPO training updates.
+3. Red/Blue real-range PPO, alternating opponent-league training, held-out
+   evaluation, and any learning claim remain unimplemented.
+4. The dashboard still presents the graph simulator; no live range timeline,
+   evidence inspector, or replay UI is connected.
+5. The documented Compose stack isolates the executor and target networks, but
+   a full container-boundary/egress denial test matrix and target crash
+   reconciliation tests remain to be added.
+
+**Next milestone:** add migration-managed persistence and Blue-visible telemetry
+with verified control outcomes before connecting either PPO policy to the real
+range.

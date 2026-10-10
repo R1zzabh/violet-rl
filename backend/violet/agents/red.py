@@ -3,31 +3,39 @@
 from __future__ import annotations
 
 import random
-from typing import Any, Dict
+from typing import TYPE_CHECKING, Any
 
-from violet.env import VIOLETEnv
+from violet.agents.base import Agent
 from violet.types import ATTACKER_AGENT, RedActionType
 
+if TYPE_CHECKING:
+    from violet.env import VIOLETEnv
 
-class RedAgent:
-    """Base class for red agents that returns a discrete action index suitable for
-    the environment's red action space."""
+
+class RedAgent(Agent):
+    """Base class for red agents returning a discrete action index.
+
+    The index targets the environment's red action space.
+    """
 
     agent_name = ATTACKER_AGENT
 
-    def select_action(self, env: VIOLETEnv, info: Dict[str, Any]) -> int:
+    def select_action(self, env: VIOLETEnv, info: dict[str, Any]) -> int:
         raise NotImplementedError
 
-    def reset(self) -> None:
-        ...
+    def reset(self) -> None: ...
 
 
 class RandomRedAgent(RedAgent):
     """Uniformly random attacker — baseline 1 (per spec)."""
 
-    def select_action(self, env: VIOLETEnv, info: Dict[str, Any]) -> int:
+    def select_action(self, env: VIOLETEnv, info: dict[str, Any]) -> int:
         action_space = env.action_space(ATTACKER_AGENT)
-        return env.rng.randint(0, action_space.n - 1) if env.rng is not None else random.randint(0, action_space.n - 1)
+        return (
+            env.rng.randint(0, action_space.n - 1)
+            if env.rng is not None
+            else random.randint(0, action_space.n - 1)
+        )
 
 
 class ScriptedAggressiveRedAgent(RedAgent):
@@ -62,7 +70,8 @@ class ScriptedAggressiveRedAgent(RedAgent):
         With no foothold yet, the entry node itself is the objective (gain initial
         access). After that, the next hop is restricted to DIRECT neighbors of the
         current foothold — the attacker walks inward one hop at a time instead of
-        teleporting to the final objective."""
+        teleporting to the final objective.
+        """
         foothold = self._current_foothold(network)
         if foothold is None:
             return self.entry_node_id
@@ -77,19 +86,23 @@ class ScriptedAggressiveRedAgent(RedAgent):
             and not network.nodes[nid].is_compromised()
         ]
         if not candidates:
-            return self.target_node_id
+            return str(self.target_node_id)
         if self.target_node_id in candidates:
-            return self.target_node_id
-        return min(candidates, key=lambda nid: self._graph_distance(network, nid, self.target_node_id))
+            return str(self.target_node_id)
+        return str(
+            min(candidates, key=lambda nid: self._graph_distance(network, nid, self.target_node_id))
+        )
 
     def _current_foothold(self, network: Any) -> str | None:
-        """The compromised node closest (by hops) to the objective."""
+        """Return the compromised node closest (by hops) to the objective."""
         compromised = [nid for nid, n in network.nodes.items() if n.is_compromised()]
         if not compromised:
             return None
-        return min(
-            compromised,
-            key=lambda nid: self._graph_distance(network, nid, self.target_node_id),
+        return str(
+            min(
+                compromised,
+                key=lambda nid: self._graph_distance(network, nid, self.target_node_id),
+            )
         )
 
     @staticmethod
@@ -119,7 +132,7 @@ class ScriptedAggressiveRedAgent(RedAgent):
     # ------------------------------------------------------------------
     # Action selection
     # ------------------------------------------------------------------
-    def select_action(self, env: VIOLETEnv, info: Dict[str, Any]) -> int:
+    def select_action(self, env: VIOLETEnv, info: dict[str, Any]) -> int:
         if env.network is None:
             raise RuntimeError("Environment not initialized")
         network = env.network
@@ -171,7 +184,7 @@ class ScriptedStealthRedAgent(RedAgent):
     def __init__(self, target_node_id: str = "database"):
         self.target_node_id = target_node_id
 
-    def select_action(self, env: VIOLETEnv, info: Dict[str, Any]) -> int:
+    def select_action(self, env: VIOLETEnv, info: dict[str, Any]) -> int:
         if env.network is None:
             raise RuntimeError("Environment not initialized")
         node_ids = list(env.network.nodes.keys())
@@ -200,22 +213,22 @@ class ScriptedLateralRedAgent(RedAgent):
     def __init__(self, target_node_id: str = "database"):
         self.target_node_id = target_node_id
 
-    def select_action(self, env: VIOLETEnv, info: Dict[str, Any]) -> int:
-        if env.network is None:
-            raise RuntimeError("Environment not initialized")
-        node_ids = list(env.network.nodes.keys())
-
-        # Find a compromised node to move from, then target a reachable node
-        compromised = [nid for nid, n in env.network.nodes.items() if n.is_compromised()]
+    def select_action(self, env: VIOLETEnv, info: dict[str, Any]) -> int:
+        assert env.network is not None, "environment not initialized"
+        network = env.network
+        node_ids = list(network.nodes.keys())
+        compromised = [nid for nid, n in network.nodes.items() if n.is_compromised()]
         if not compromised:
             # No foothold yet — scan/exploit the most connected node
-            target_id = max(node_ids, key=lambda nid: len(env.network.nodes[nid].connections))
+            target_id = max(node_ids, key=lambda nid: len(network.nodes[nid].connections))
             target_idx = node_ids.index(target_id)
             action_type = RedActionType.EXPLOIT
         else:
             source_id = compromised[0]
             reachable = env.network.reachable_from(source_id)
-            uncompromised = [nid for nid in reachable if not env.network.nodes[nid].is_compromised()]
+            uncompromised = [
+                nid for nid in reachable if not env.network.nodes[nid].is_compromised()
+            ]
             if uncompromised:
                 target_id = uncompromised[0]
                 target_idx = node_ids.index(target_id)
@@ -232,13 +245,14 @@ class ScriptedLateralRedAgent(RedAgent):
 class ScriptedRandomizedRedAgent(RedAgent):
     """Scripted but stochastic red — chooses among plausible actions with weights."""
 
-    def select_action(self, env: VIOLETEnv, info: Dict[str, Any]) -> int:
+    def select_action(self, env: VIOLETEnv, info: dict[str, Any]) -> int:
         if env.network is None:
             raise RuntimeError("Environment not initialized")
         action_space = env.action_space(ATTACKER_AGENT)
         # Uniform random draw from the discrete action space (random.Random
         # has no weighted choice; uniform is the intended behavior here).
-        return env.rng.randint(0, action_space.n - 1)
+        assert env.rng is not None, "environment RNG not initialized"
+        return int(env.rng.randint(0, action_space.n - 1))
 
 
 class ScriptedObjectiveRedAgent(RedAgent):
@@ -247,13 +261,14 @@ class ScriptedObjectiveRedAgent(RedAgent):
     def __init__(self, objective_node_id: str = "database"):
         self.objective_node_id = objective_node_id
 
-    def select_action(self, env: VIOLETEnv, info: Dict[str, Any]) -> int:
+    def select_action(self, env: VIOLETEnv, info: dict[str, Any]) -> int:
         if env.network is None:
             raise RuntimeError("Environment not initialized")
-        node_ids = list(env.network.nodes.keys())
+        network = env.network
+        node_ids = list(network.nodes.keys())
         if self.objective_node_id not in node_ids:
             # objective not in network; pick highest-value node
-            target_id = max(node_ids, key=lambda nid: env.network.nodes[nid].value)
+            target_id = max(node_ids, key=lambda nid: network.nodes[nid].value)
         else:
             target_id = self.objective_node_id
 

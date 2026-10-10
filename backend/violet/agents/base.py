@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 from violet.types import ATTACKER_AGENT, DEFENDER_AGENT
 
@@ -19,7 +19,7 @@ class Agent:
     def select_action(
         self,
         observation: Any,
-        info: Dict[str, Any],
+        info: dict[str, Any],
     ) -> int:
         raise NotImplementedError
 

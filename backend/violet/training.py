@@ -3,15 +3,18 @@
 from __future__ import annotations
 
 import json
-import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import TYPE_CHECKING, Any
 
-from violet.agents import Agent
-from violet.env import VIOLETEnv
 from violet.rewards import RewardConfig
 from violet.types import ATTACKER_AGENT, DEFENDER_AGENT
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
+
+    from violet.agents import Agent
+    from violet.env import VIOLETEnv
 
 
 @dataclass
@@ -24,9 +27,9 @@ class EpisodeMetrics:
     red_steps: int
     blue_steps: int
     winner: str | None
-    red_stats: Dict[str, Any] = field(default_factory=dict)
-    blue_stats: Dict[str, Any] = field(default_factory=dict)
-    events: List[Dict[str, Any]] = field(default_factory=list)
+    red_stats: dict[str, Any] = field(default_factory=dict)
+    blue_stats: dict[str, Any] = field(default_factory=dict)
+    events: list[dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass
@@ -51,7 +54,7 @@ def _make_run_dir(base_dir: str, run_id: str) -> Path:
     return path
 
 
-def _write_metrics_jsonl(run_dir: Path, metrics: List[EpisodeMetrics]) -> None:
+def _write_metrics_jsonl(run_dir: Path, metrics: list[EpisodeMetrics]) -> None:
     metrics_path = run_dir / "metrics" / "training.jsonl"
     with open(metrics_path, "a") as f:
         for m in metrics:
@@ -64,28 +67,29 @@ def train_red(
     blue_agent: Agent,
     config: TrainingConfig,
     base_dir: str = "runs",
-    on_episode: Optional[Callable[[EpisodeMetrics], None]] = None,
-) -> List[EpisodeMetrics]:
+    on_episode: Callable[[EpisodeMetrics], None] | None = None,
+) -> list[EpisodeMetrics]:
     """Train RED against a fixed BLUE for one phase.
 
     Skeleton: extends to full RLlib integration later. For now it runs the
     environment with the given agents and records metrics.
     """
     run_dir = _make_run_dir(base_dir, config.run_id)
-    metrics: List[EpisodeMetrics] = []
+    metrics: list[EpisodeMetrics] = []
     best_metric: float = -float("inf")
 
     for episode in range(1, config.max_episodes + 1):
-        obs, infos = env.reset(seed=config.environment_seed + episode)
+        _obs, infos = env.reset(seed=config.environment_seed + episode)
         red_agent.reset()
         blue_agent.reset()
 
         episode_reward_red = 0.0
         episode_reward_blue = 0.0
-        episode_events: List[Dict[str, Any]] = []
+        episode_events: list[dict[str, Any]] = []
         terminated = False
+        step = 0
 
-        for step in range(config.max_cycles_per_episode):
+        for step in range(config.max_cycles_per_episode):  # noqa: B007 — step feeds length/red_steps below
             if terminated:
                 break
 
@@ -96,7 +100,7 @@ def train_red(
                 ATTACKER_AGENT: red_action,
                 DEFENDER_AGENT: blue_action,
             }
-            obs, rewards, terminations, truncations, infos = env.step(actions)
+            _obs, rewards, terminations, truncations, infos = env.step(actions)
 
             episode_reward_red += rewards.get(ATTACKER_AGENT, 0.0)
             episode_reward_blue += rewards.get(DEFENDER_AGENT, 0.0)
@@ -150,13 +154,12 @@ def train_red(
             with open(ckpt_dir / "checkpoint_meta.json", "w") as f:
                 json.dump(ckpt_meta, f, indent=2)
 
-            if config.best_checkpoint_metric == "blue_reward":
-                if episode_reward_blue > best_metric:
-                    best_metric = episode_reward_blue
-                    best_dir = run_dir / "checkpoints" / "checkpoint_best"
-                    best_dir.mkdir(parents=True, exist_ok=True)
-                    with open(best_dir / "checkpoint_meta.json", "w") as f:
-                        json.dump(ckpt_meta, f, indent=2)
+            if config.best_checkpoint_metric == "blue_reward" and episode_reward_blue > best_metric:
+                best_metric = episode_reward_blue
+                best_dir = run_dir / "checkpoints" / "checkpoint_best"
+                best_dir.mkdir(parents=True, exist_ok=True)
+                with open(best_dir / "checkpoint_meta.json", "w") as f:
+                    json.dump(ckpt_meta, f, indent=2)
 
         # Write metrics incrementally (so a crash doesn't lose everything)
         _write_metrics_jsonl(run_dir, metrics[-50:])  # keep recent in the file
@@ -172,8 +175,8 @@ def train_blue(
     blue_agent: Agent,
     config: TrainingConfig,
     base_dir: str = "runs",
-    on_episode: Optional[Callable[[EpisodeMetrics], None]] = None,
-) -> List[EpisodeMetrics]:
+    on_episode: Callable[[EpisodeMetrics], None] | None = None,
+) -> list[EpisodeMetrics]:
     """Train BLUE against a fixed RED for phase 1.
 
     Same skeleton as train_red but conceptually the defender is learning.
@@ -192,16 +195,17 @@ def evaluate_episode(
 
     Used for independent evaluation, separate from training.
     """
-    obs, infos = env.reset(seed=seed)
+    _obs, infos = env.reset(seed=seed)
     red_agent.reset()
     blue_agent.reset()
 
     episode_reward_red = 0.0
     episode_reward_blue = 0.0
-    episode_events: List[Dict[str, Any]] = []
+    episode_events: list[dict[str, Any]] = []
     terminated = False
+    step = 0
 
-    for step in range(max_cycles):
+    for step in range(max_cycles):  # noqa: B007 — step feeds length/red_steps below
         if terminated:
             break
         red_action = red_agent.select_action(env, infos.get(ATTACKER_AGENT, {}))
@@ -210,7 +214,7 @@ def evaluate_episode(
             ATTACKER_AGENT: red_action,
             DEFENDER_AGENT: blue_action,
         }
-        obs, rewards, terminations, truncations, infos = env.step(actions)
+        _obs, rewards, terminations, truncations, infos = env.step(actions)
         episode_reward_red += rewards.get(ATTACKER_AGENT, 0.0)
         episode_reward_blue += rewards.get(DEFENDER_AGENT, 0.0)
         terminated = any(terminations.values()) or any(truncations.values())

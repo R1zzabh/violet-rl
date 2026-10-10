@@ -1,6 +1,8 @@
 # tests/smoke/test_smoke.py — VIOLET
 
-from violet.agents import ScriptedAggressiveRedAgent, RuleBasedBlueAgent
+from typing import Any
+
+from violet.agents import RuleBasedBlueAgent, ScriptedAggressiveRedAgent
 from violet.env import VIOLETEnv
 from violet.scenarios import v1_enterprise_network
 
@@ -21,7 +23,7 @@ def test_smoke_full_episode_scripted_agents():
 
     red_reward = 0.0
     blue_reward = 0.0
-    events: list[dict] = []
+    events: list[dict[str, Any]] = []
     terminated = False
 
     for step in range(50):
@@ -67,6 +69,7 @@ def test_smoke_red_can_reach_objective_in_few_steps():
         actions = {"red": red_action, "blue": blue_action}
         obs, rewards, terminations, truncations, infos = env.step(actions)
 
+        assert env.network is not None
         if env.network.nodes["web"].is_compromised():
             web_compromised = True
             break

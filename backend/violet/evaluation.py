@@ -10,21 +10,23 @@ import json
 import statistics
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any
 
-from violet.agents.base import Agent
-from violet.env import VIOLETEnv
 from violet.types import ATTACKER_AGENT, DEFENDER_AGENT
+
+if TYPE_CHECKING:
+    from violet.agents.base import Agent
+    from violet.env import VIOLETEnv
 
 
 @dataclass
 class EvaluationConfig:
     n_episodes: int = 20
-    seed_start: int = 10_000       # unseen-seed range, disjoint from training seeds
+    seed_start: int = 10_000  # unseen-seed range, disjoint from training seeds
     max_cycles: int = 100
-    deterministic: bool = True     # greedy actions for both RL agents
+    deterministic: bool = True  # greedy actions for both RL agents
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 
 
@@ -34,19 +36,19 @@ class EpisodeRecord:
     length: int
     red_reward: float
     blue_reward: float
-    winner: Optional[str]
+    winner: str | None
     database_compromised: bool
-    compromised_nodes: List[str]
+    compromised_nodes: list[str]
     terminated: bool  # terminal state (vs truncation at the step limit)
 
 
 @dataclass
 class EvaluationReport:
-    config: Dict[str, Any]
-    episodes: List[EpisodeRecord] = field(default_factory=list)
-    summary: Dict[str, Any] = field(default_factory=dict)
+    config: dict[str, Any]
+    episodes: list[EpisodeRecord] = field(default_factory=list)
+    summary: dict[str, Any] = field(default_factory=dict)
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         return {
             "config": self.config,
             "episodes": [asdict(e) for e in self.episodes],
@@ -71,9 +73,7 @@ def _finalize(
 ) -> EpisodeRecord:
     network = env.network
     assert network is not None
-    compromised = [
-        nid for nid, node in network.nodes.items() if node.is_compromised()
-    ]
+    compromised = [nid for nid, node in network.nodes.items() if node.is_compromised()]
     critical_compromised = [
         nid
         for nid, node in network.nodes.items()
@@ -96,7 +96,7 @@ def evaluate_pair(
     env: VIOLETEnv,
     red_agent: Agent,
     blue_agent: Agent,
-    config: Optional[EvaluationConfig] = None,
+    config: EvaluationConfig | None = None,
 ) -> EvaluationReport:
     """Run head-to-head episodes on unseen seeds and aggregate metrics.
 
@@ -109,17 +109,17 @@ def evaluate_pair(
 
     for i in range(cfg.n_episodes):
         seed = cfg.seed_start + i
-        obs, infos = env.reset(seed=seed)
+        _obs, infos = env.reset(seed=seed)
         red_agent.reset()
         blue_agent.reset()
 
         red_r = blue_r = 0.0
         terminated = False
         steps = 0
-        for steps in range(1, cfg.max_cycles + 1):
+        for steps in range(1, cfg.max_cycles + 1):  # noqa: B007 — steps feeds length below
             red_action = red_agent.select_action(env, infos.get(ATTACKER_AGENT, {}))
             blue_action = blue_agent.select_action(env, infos.get(DEFENDER_AGENT, {}))
-            obs, rewards, terminations, truncations, infos = env.step(
+            _obs, rewards, terminations, truncations, infos = env.step(
                 {ATTACKER_AGENT: red_action, DEFENDER_AGENT: blue_action}
             )
             red_r += float(rewards[ATTACKER_AGENT])
@@ -128,15 +128,13 @@ def evaluate_pair(
                 terminated = bool(terminations[ATTACKER_AGENT])
                 break
 
-        report.episodes.append(
-            _finalize(env, seed, red_r, blue_r, steps, terminated)
-        )
+        report.episodes.append(_finalize(env, seed, red_r, blue_r, steps, terminated))
 
     report.summary = _summarize(report.episodes)
     return report
 
 
-def _summarize(episodes: List[EpisodeRecord]) -> Dict[str, Any]:
+def _summarize(episodes: list[EpisodeRecord]) -> dict[str, Any]:
     n = len(episodes)
     if n == 0:
         return {"n_episodes": 0}

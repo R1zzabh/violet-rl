@@ -1,6 +1,6 @@
 # tests/unit/test_env.py — VIOLET
 
-import pytest
+import contextlib
 
 from violet.env import VIOLETEnv
 from violet.scenarios import v1_enterprise_network
@@ -63,6 +63,7 @@ def test_step_rewards_summable():
     total_red = 0.0
     total_blue = 0.0
     for _ in range(5):
+        assert env.rng is not None
         actions = {
             ATTACKER_AGENT: env.rng.randint(0, env.action_space(ATTACKER_AGENT).n - 1),
             DEFENDER_AGENT: env.rng.randint(0, env.action_space(DEFENDER_AGENT).n - 1),
@@ -117,12 +118,10 @@ def test_invalid_action_still_runs():
         ATTACKER_AGENT: env.action_space(ATTACKER_AGENT).n * 2,
         DEFENDER_AGENT: 0,
     }
-    try:
-        _, rewards, terminations, truncations, infos = env.step(actions)
-        # If it doesn't raise, the env is at least not crashing.
-    except Exception as e:
-        # If it raises, that's acceptable as long as it's an expected validation error.
-        pass
+    # Out-of-range actions are either rejected by the env or handled without
+    # crashing — both outcomes are acceptable here; nothing to assert further.
+    with contextlib.suppress(Exception):
+        env.step(actions)
 
 
 def test_determinism_same_seed():

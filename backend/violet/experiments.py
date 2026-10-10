@@ -4,16 +4,28 @@ from __future__ import annotations
 
 import json
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional
 
+from violet.agents import (
+    Agent,
+    ProactiveBlueAgent,
+    RandomBlueAgent,
+    RandomRedAgent,
+    ReactiveBlueAgent,
+    RuleBasedBlueAgent,
+    ScriptedAggressiveRedAgent,
+    ScriptedLateralRedAgent,
+    ScriptedObjectiveRedAgent,
+    ScriptedRandomizedRedAgent,
+    ScriptedStealthRedAgent,
+)
 from violet.analytics import behavior_discovery_report
-from violet.agents import Agent, RandomBlueAgent, RandomRedAgent, RuleBasedBlueAgent, ScriptedAggressiveRedAgent
-from violet.training import EpisodeMetrics, TrainingConfig, evaluate_episode, train_blue
 from violet.env import VIOLETEnv
 from violet.rewards import RewardConfig
 from violet.scenarios import v1_enterprise_network
+from violet.training import EpisodeMetrics, TrainingConfig, evaluate_episode, train_blue
+from violet.types import EpisodeResult
 
 
 @dataclass
@@ -38,20 +50,22 @@ class ExperimentRunner:
     def __init__(self, config: ExperimentConfig, base_dir: str = "runs"):
         self.config = config
         self.base_dir = base_dir
-        self.env: Optional[VIOLETEnv] = None
-        self.red_agent: Optional[Agent] = None
-        self.blue_agent: Optional[Agent] = None
-        self.training_metrics: List[EpisodeMetrics] = []
-        self.evaluation_metrics: List[EpisodeMetrics] = []
+        self.env: VIOLETEnv | None = None
+        self.red_agent: Agent | None = None
+        self.blue_agent: Agent | None = None
+        self.training_metrics: list[EpisodeMetrics] = []
+        self.evaluation_metrics: list[EpisodeMetrics] = []
 
     def setup(self) -> None:
         """Create environment + agents from config."""
-        self.env = VIOLETEnv(scenario_fn=v1_enterprise_network, max_cycles=self.config.max_cycles_per_episode, seed=self.config.seed)
+        self.env = VIOLETEnv(
+            scenario_fn=v1_enterprise_network,
+            max_cycles=self.config.max_cycles_per_episode,
+            seed=self.config.seed,
+        )
         self._make_agents()
 
     def _make_agents(self) -> None:
-        from violet.agents import ScriptedStealthRedAgent, ScriptedLateralRedAgent
-
         red_map = {
             "random": RandomRedAgent(),
             "scripted_aggressive": ScriptedAggressiveRedAgent(target_node_id="database"),
@@ -71,10 +85,11 @@ class ExperimentRunner:
         # Blue: in phase 1 we may use random/rule-based; in later phases we'd instantiate an RLAgent.
         self.blue_agent = blue_map.get(self.config.blue_policy, RandomBlueAgent())
 
-    def run_training(self) -> List[EpisodeMetrics]:
+    def run_training(self) -> list[EpisodeMetrics]:
         """Run training episodes."""
-        if self.env is None:
+        if self.env is None or self.red_agent is None or self.blue_agent is None:
             self.setup()
+        assert self.env is not None and self.red_agent is not None and self.blue_agent is not None
         self.training_metrics = train_blue(
             self.env,
             self.red_agent,
@@ -94,29 +109,53 @@ class ExperimentRunner:
         )
         return self.training_metrics
 
-    def run_evaluation(self, seeds: Optional[List[int]] = None) -> List[EpisodeMetrics]:
+    def run_evaluation(self, seeds: list[int] | None = None) -> list[EpisodeMetrics]:
         """Run independent evaluation episodes (different seeds from training)."""
-        if self.env is None:
+        if self.env is None or self.red_agent is None or self.blue_agent is None:
             self.setup()
+        assert self.env is not None and self.red_agent is not None and self.blue_agent is not None
         if seeds is None:
-            seeds = list(range(self.config.evaluation_seed, self.config.evaluation_seed + self.config.evaluation_episodes))
-        metrics: List[EpisodeMetrics] = []
+            seeds = list(
+                range(
+                    self.config.evaluation_seed,
+                    self.config.evaluation_seed + self.config.evaluation_episodes,
+                )
+            )
+        metrics: list[EpisodeMetrics] = []
         for s in seeds:
-            m = evaluate_episode(self.env, self.red_agent, self.blue_agent, seed=s, max_cycles=self.config.max_cycles_per_episode)
+            m = evaluate_episode(
+                self.env,
+                self.red_agent,
+                self.blue_agent,
+                seed=s,
+                max_cycles=self.config.max_cycles_per_episode,
+            )
             metrics.append(m)
         self.evaluation_metrics = metrics
         return metrics
 
-    def run_baseline_evaluation(self) -> List[EpisodeMetrics]:
+    def run_baseline_evaluation(self) -> list[EpisodeMetrics]:
         """Run the same evaluation with a baseline policy for comparison."""
         if self.env is None:
             self.setup()
+        assert self.env is not None
         baseline_red = RandomRedAgent()
         baseline_blue = RandomBlueAgent()
-        seeds = list(range(self.config.evaluation_seed, self.config.evaluation_seed + self.config.evaluation_episodes))
-        metrics: List[EpisodeMetrics] = []
+        seeds = list(
+            range(
+                self.config.evaluation_seed,
+                self.config.evaluation_seed + self.config.evaluation_episodes,
+            )
+        )
+        metrics: list[EpisodeMetrics] = []
         for s in seeds:
-            m = evaluate_episode(self.env, baseline_red, baseline_blue, seed=s, max_cycles=self.config.max_cycles_per_episode)
+            m = evaluate_episode(
+                self.env,
+                baseline_red,
+                baseline_blue,
+                seed=s,
+                max_cycles=self.config.max_cycles_per_episode,
+            )
             metrics.append(m)
         return metrics
 
@@ -131,6 +170,7 @@ class ExperimentRunner:
 
         # config.yaml
         import yaml
+
         config_dict = {
             "run_id": self.config.run_id,
             "scenario": self.config.scenario,
@@ -166,8 +206,12 @@ class ExperimentRunner:
             "checkpoint_path": str(run_dir / "checkpoints"),
             "metrics_summary": {
                 "episodes": len(self.training_metrics),
-                "final_red_reward": self.training_metrics[-1].red_reward if self.training_metrics else None,
-                "final_blue_reward": self.training_metrics[-1].blue_reward if self.training_metrics else None,
+                "final_red_reward": self.training_metrics[-1].red_reward
+                if self.training_metrics
+                else None,
+                "final_blue_reward": self.training_metrics[-1].blue_reward
+                if self.training_metrics
+                else None,
             },
         }
         with open(run_dir / "metadata.json", "w") as f:
@@ -186,21 +230,48 @@ class ExperimentRunner:
                 "run_id": self.config.run_id,
                 "evaluation_episodes": len(self.evaluation_metrics),
                 "seeds": [m.seed for m in self.evaluation_metrics],
-                "mean_red_reward": sum(m.red_reward for m in self.evaluation_metrics) / len(self.evaluation_metrics),
-                "mean_blue_reward": sum(m.blue_reward for m in self.evaluation_metrics) / len(self.evaluation_metrics),
-                "attack_success_rate": sum(1 for m in self.evaluation_metrics if m.winner == "red") / len(self.evaluation_metrics),
-                "events": [m.events for m in self.evaluation_metrics[:10]],  # keep a few sample episodes
+                "mean_red_reward": sum(m.red_reward for m in self.evaluation_metrics)
+                / len(self.evaluation_metrics),
+                "mean_blue_reward": sum(m.blue_reward for m in self.evaluation_metrics)
+                / len(self.evaluation_metrics),
+                "attack_success_rate": sum(1 for m in self.evaluation_metrics if m.winner == "red")
+                / len(self.evaluation_metrics),
+                "events": [
+                    m.events for m in self.evaluation_metrics[:10]
+                ],  # keep a few sample episodes
             }
             with open(eval_path, "w") as f:
                 json.dump(summary, f, indent=2)
 
         # behavior discovery report (if we have evaluation data)
         if self.evaluation_metrics:
-            baseline = self.run_baseline_evaluation()
-            report = behavior_discovery_report(
+            baseline_metrics = self.run_baseline_evaluation()
+
+            def to_episode_result(m: EpisodeMetrics, config_version: str) -> EpisodeResult:
+                return EpisodeResult(
+                    episode_id=m.episode_id,
+                    seed=m.seed,
+                    config_version=config_version,
+                    length=m.length,
+                    red_reward=m.red_reward,
+                    blue_reward=m.blue_reward,
+                    winner=m.winner,
+                    red_stats=m.red_stats,
+                    blue_stats=m.blue_stats,
+                    events=m.events,
+                )
+
+            baseline = [
+                to_episode_result(m, self.config.environment_version) for m in baseline_metrics
+            ]
+            evaluation_results = [
+                to_episode_result(m, self.config.environment_version)
+                for m in self.evaluation_metrics
+            ]
+            behavior_discovery_report(
                 run_id=self.config.run_id,
-                red_results=self.evaluation_metrics,
-                blue_results=self.evaluation_metrics,
+                red_results=evaluation_results,
+                blue_results=evaluation_results,
                 red_baseline=baseline,
                 blue_baseline=baseline,
                 output_dir=str(run_dir / "evaluation"),
@@ -211,12 +282,11 @@ class ExperimentRunner:
     def _git_commit(self) -> str:
         """Best-effort git commit lookup."""
         import subprocess
+
         try:
-            out = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True, stderr=subprocess.DEVNULL).strip()
+            out = subprocess.check_output(
+                ["git", "rev-parse", "HEAD"], text=True, stderr=subprocess.DEVNULL
+            ).strip()
             return out
         except Exception:
             return "unknown"
-
-
-# Convenience alias for the blue/reactive agent used above
-from violet.agents.blue import ReactiveBlueAgent, ProactiveBlueAgent  # noqa: E402

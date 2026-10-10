@@ -1,4 +1,15 @@
 # docker/backend/Dockerfile — VIOLET
+#
+# Build context is the REPOSITORY ROOT (see docker-compose.yml):
+#   docker build -f docker/backend/Dockerfile .
+#
+# There is no backend/configs directory in this repo: all scenario/config
+# data lives in code (violet.scenarios) and runs/ artifacts are mounted at
+# runtime. Nothing is copied from a configs path.
+#
+# Note on the pip installs below: the package itself is copied first and
+# installed non-editable; `.[dev]` provides the test tooling so the image can
+# also run the pytest suite (`docker run violet-backend pytest tests -q`).
 
 FROM python:3.12-slim AS base
 
@@ -11,23 +22,22 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 WORKDIR /app
 
 # ---- deps ----
+# Copy the package source before installing so hatchling can build it.
 COPY backend/pyproject.toml backend/README.md ./
-# Optional: a lockfile (poetry.lock / requirements.txt) would make this reproducible.
-# For now install the package + optional deps we need in production.
+COPY backend/violet ./violet
+
 RUN pip install --upgrade pip \
     && pip install ".[api]" \
     && pip install ".[dev]" \
     && rm -rf /root/.cache/pip
 
-# ---- app ----
-COPY backend/violet ./violet
+# ---- app (tests + scripts only; package already installed above) ----
 COPY backend/tests ./tests
 COPY backend/scripts ./scripts
-COPY backend/configs ./configs
 
 # Non-root user
-RUN addgroup --system violet \
-    && adduser --system --ingroup violet violet \
+RUN addgroup --system --gid 10001 violet \
+    && adduser --system --uid 10001 --ingroup violet violet \
     && chown -R violet:violet /app
 USER violet
 

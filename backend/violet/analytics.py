@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import json
-from collections import Counter, defaultdict
+from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any
 
-from violet.types import ATTACKER_AGENT, EpisodeResult
+from violet.types import ATTACKER_AGENT, DEFENDER_AGENT, EpisodeResult
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 
 @dataclass
@@ -25,7 +28,7 @@ class BehaviorPattern:
     baseline_total: int
     improvement_description: str
     confidence: str  # "HIGH", "MEDIUM", "LOW"
-    side_effects: List[str] = field(default_factory=list)
+    side_effects: list[str] = field(default_factory=list)
 
     @property
     def frequency_pct(self) -> float:
@@ -41,21 +44,21 @@ class ActionDistribution:
     """Action selection frequency for an agent, optionally conditioned on state."""
 
     agent: str
-    action_counts: Dict[str, int]
+    action_counts: dict[str, int]
     total: int
     condition: str = ""
 
 
 def analyze_red_behaviors(
-    episode_results: List[EpisodeResult],
-    baseline_results: List[EpisodeResult],
-) -> List[BehaviorPattern]:
+    episode_results: list[EpisodeResult],
+    baseline_results: list[EpisodeResult],
+) -> list[BehaviorPattern]:
     """Discover red behaviors from evaluation trajectories.
 
     Example: "under condition: initial foothold on WEB, observed tendency: lateral
     movement toward APP in 71/100 episodes, baseline 43/100."
     """
-    behaviors: List[BehaviorPattern] = []
+    behaviors: list[BehaviorPattern] = []
 
     # Behavior 01: lateral movement toward APP after WEB compromise
     episodes_with_web_compromised = 0
@@ -102,32 +105,34 @@ def analyze_red_behaviors(
         )
     )
 
-    behaviors.append(BehaviorPattern(
-        id="DISCOVERED-01",
-        agent="red",
-        condition="Initial foothold established on WEB (exploited successfully)",
-        observed_behavior="Lateral movement toward APP",
-        frequency=episodes_lateral_to_app,
-        total_evaluated=episodes_with_web_compromised,
-        baseline_count=baseline_lateral,
-        baseline_total=max(1, baseline_web),
-        improvement_description=f"{episodes_lateral_to_app}/{max(1, episodes_with_web_compromised)} evaluated vs {baseline_lateral}/{max(1, baseline_web)} baseline",
-        confidence="HIGH" if episodes_with_web_compromised >= 50 else "MEDIUM",
-    ))
+    behaviors.append(
+        BehaviorPattern(
+            id="DISCOVERED-01",
+            agent="red",
+            condition="Initial foothold established on WEB (exploited successfully)",
+            observed_behavior="Lateral movement toward APP",
+            frequency=episodes_lateral_to_app,
+            total_evaluated=episodes_with_web_compromised,
+            baseline_count=baseline_lateral,
+            baseline_total=max(1, baseline_web),
+            improvement_description=f"{episodes_lateral_to_app}/{max(1, episodes_with_web_compromised)} evaluated vs {baseline_lateral}/{max(1, baseline_web)} baseline",
+            confidence="HIGH" if episodes_with_web_compromised >= 50 else "MEDIUM",
+        )
+    )
 
     return behaviors
 
 
 def analyze_blue_behaviors(
-    episode_results: List[EpisodeResult],
-    baseline_results: List[EpisodeResult],
-) -> List[BehaviorPattern]:
+    episode_results: list[EpisodeResult],
+    baseline_results: list[EpisodeResult],
+) -> list[BehaviorPattern]:
     """Discover blue behaviors from evaluation trajectories.
 
     Example: "under condition: suspicious lateral movement detected, blue policy
     selects ISOLATE APP in 82% of episodes, baseline 31%."
     """
-    behaviors: List[BehaviorPattern] = []
+    behaviors: list[BehaviorPattern] = []
 
     # Condition: lateral movement event occurred
     episodes_with_lateral = 0
@@ -135,9 +140,7 @@ def analyze_blue_behaviors(
     for ep in episode_results:
         events = ep.events
         lateral_event = any(
-            e.get("agent") == "red"
-            and e.get("action") == "LATERAL_MOVE"
-            for e in events
+            e.get("agent") == "red" and e.get("action") == "LATERAL_MOVE" for e in events
         )
         if lateral_event:
             episodes_with_lateral += 1
@@ -153,51 +156,47 @@ def analyze_blue_behaviors(
     baseline_lateral_count = sum(
         1
         for ep in baseline_results
-        if any(
-            e.get("agent") == "red"
-            and e.get("action") == "LATERAL_MOVE"
-            for e in ep.events
-        )
+        if any(e.get("agent") == "red" and e.get("action") == "LATERAL_MOVE" for e in ep.events)
     )
     baseline_isolated_app = sum(
         1
         for ep in baseline_results
         if any(
-            e.get("agent") == "blue"
-            and e.get("action") == "ISOLATE"
-            and e.get("target") == "app"
+            e.get("agent") == "blue" and e.get("action") == "ISOLATE" and e.get("target") == "app"
             for e in ep.events
         )
     )
 
-    behaviors.append(BehaviorPattern(
-        id="DISCOVERED-07",
-        agent="blue",
-        condition="Suspicious lateral movement detected (RED LATERAL_MOVE event)",
-        observed_behavior="ISOLATE APP",
-        frequency=episodes_isolated_app,
-        total_evaluated=episodes_with_lateral,
-        baseline_count=baseline_isolated_app,
-        baseline_total=max(1, baseline_lateral_count),
-        improvement_description=f"{episodes_isolated_app}/{max(1, episodes_with_lateral)} evaluated vs {baseline_isolated_app}/{max(1, baseline_lateral_count)} baseline",
-        confidence="HIGH" if episodes_with_lateral >= 50 else "MEDIUM",
-        side_effects=["Service availability impact measured separately"],
-    ))
+    behaviors.append(
+        BehaviorPattern(
+            id="DISCOVERED-07",
+            agent="blue",
+            condition="Suspicious lateral movement detected (RED LATERAL_MOVE event)",
+            observed_behavior="ISOLATE APP",
+            frequency=episodes_isolated_app,
+            total_evaluated=episodes_with_lateral,
+            baseline_count=baseline_isolated_app,
+            baseline_total=max(1, baseline_lateral_count),
+            improvement_description=f"{episodes_isolated_app}/{max(1, episodes_with_lateral)} evaluated vs {baseline_isolated_app}/{max(1, baseline_lateral_count)} baseline",
+            confidence="HIGH" if episodes_with_lateral >= 50 else "MEDIUM",
+            side_effects=["Service availability impact measured separately"],
+        )
+    )
 
     return behaviors
 
 
 def action_distribution(
-    episode_results: List[EpisodeResult],
+    episode_results: list[EpisodeResult],
     agent: str,
-    condition_fn: Optional[Callable[[EpisodeResult], bool]] = None,
+    condition_fn: Callable[[EpisodeResult], bool] | None = None,
 ) -> ActionDistribution:
     """Compute action selection frequency for *agent* across trajectories.
 
     If *condition_fn* is provided, only episodes matching the condition are counted
     (state-conditioned distribution).
     """
-    counts: Dict[str, int] = defaultdict(int)
+    counts: dict[str, int] = defaultdict(int)
     total = 0
 
     for ep in episode_results:
@@ -218,15 +217,15 @@ def action_distribution(
 
 
 def heatmap_data(
-    episode_results: List[EpisodeResult],
+    episode_results: list[EpisodeResult],
     agent: str,
-) -> Dict[str, Dict[str, int]]:
+) -> dict[str, dict[str, int]]:
     """Return a state x action count table for conditional policy analysis.
 
     Rows = observed state (derived from alert/compromise flags in events).
     Columns = action selected.
     """
-    data: Dict[str, Dict[str, int]] = defaultdict(lambda: defaultdict(int))
+    data: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
     for ep in episode_results:
         for ev in ep.events:
             if ev.get("agent") == agent:
@@ -235,9 +234,9 @@ def heatmap_data(
                 for e in ep.events:
                     if e.get("step", 0) <= ev.get("step", 0):
                         if e.get("agent") == "red" and e.get("result") == "exploit_success":
-                            state = f"{e.get('target','?')} compromised"
+                            state = f"{e.get('target', '?')} compromised"
                         elif e.get("agent") == "blue" and e.get("result") == "monitor_detected":
-                            state = f"{e.get('target','?')} alert"
+                            state = f"{e.get('target', '?')} alert"
                 action = ev.get("action", "UNKNOWN")
                 data[state][action] += 1
     return dict(data)
@@ -245,12 +244,12 @@ def heatmap_data(
 
 def behavior_discovery_report(
     run_id: str,
-    red_results: List[EpisodeResult],
-    blue_results: List[EpisodeResult],
-    red_baseline: List[EpisodeResult],
-    blue_baseline: List[EpisodeResult],
-    output_dir: Optional[str] = None,
-) -> Dict[str, Any]:
+    red_results: list[EpisodeResult],
+    blue_results: list[EpisodeResult],
+    red_baseline: list[EpisodeResult],
+    blue_baseline: list[EpisodeResult],
+    output_dir: str | None = None,
+) -> dict[str, Any]:
     """Produce the full behavior discovery report (for the dashboard + docs)."""
     red_behaviors = analyze_red_behaviors(red_results, red_baseline)
     blue_behaviors = analyze_blue_behaviors(blue_results, blue_baseline)
@@ -273,9 +272,7 @@ def behavior_discovery_report(
         blue_results,
         DEFENDER_AGENT,
         condition_fn=lambda ep: any(
-            e.get("agent") == "red"
-            and e.get("action") == "LATERAL_MOVE"
-            for e in ep.events
+            e.get("agent") == "red" and e.get("action") == "LATERAL_MOVE" for e in ep.events
         ),
     )
 
@@ -340,4 +337,3 @@ def behavior_discovery_report(
 
 
 # Backward compat for callables used above
-

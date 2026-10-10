@@ -2,47 +2,54 @@
 
 from __future__ import annotations
 
-import copy
+import random
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, ClassVar
 
 from pettingzoo import ParallelEnv
 
-from violet.network import Network
+from violet.rewards import RewardEngine
 from violet.scenarios import v1_enterprise_network
 from violet.transition import TransitionContext, TransitionEngine
 from violet.types import (
     ATTACKER_AGENT,
-    BlueActionType,
     DEFENDER_AGENT,
+    Action,
+    ActionTarget,
+    BlueActionType,
     RedActionType,
 )
-from violet.rewards import RewardEngine
 
+if TYPE_CHECKING:
+    from collections.abc import Callable, Iterator
+
+    from violet.network import Network
 
 # ---------------------------------------------------------------------------
 # Optional gymnasium support — the environment works without it in smoke/dev mode.
 # Real RLlib integration will import gymnasium properly.
 # ---------------------------------------------------------------------------
 try:
-    import gymnasium as _gym  # noqa: F401
+    import gymnasium as _gym
     from gymnasium import spaces
 except Exception:  # pragma: no cover — degraded dev mode
-    _gym = None
+    _gym = None  # type: ignore[assignment]
 
     class _DegradedBox:
-        def __init__(self, low=-1.0, high=1.0, shape=(0,), dtype=float):
+        def __init__(
+            self, low: Any = -1.0, high: Any = 1.0, shape: Any = (0,), dtype: Any = float
+        ) -> None:
             self.low = low
             self.high = high
             self.shape = shape
             self.dtype = dtype
 
     class _DegradedDiscrete:
-        def __init__(self, n: int):
+        def __init__(self, n: int) -> None:
             self.n = n
             self.dtype = "int64"
 
-    class spaces:
+    class spaces:  # type: ignore[no-redef]  # noqa: N801 — mirrors gymnasium.spaces API
         Box = _DegradedBox
         Discrete = _DegradedDiscrete
 
@@ -53,7 +60,7 @@ except Exception:  # pragma: no cover — degraded dev mode
 _OBS_FEATURE_DIM = 64
 
 
-class VIOLETEnv(ParallelEnv):
+class VIOLETEnv(ParallelEnv):  # type: ignore[misc]
     """PettingZoo ParallelEnv for the VIOLET multi-agent cyber environment.
 
     Agents:
@@ -64,7 +71,7 @@ class VIOLETEnv(ParallelEnv):
     observability: each agent receives a subset of the true state.
     """
 
-    metadata = {
+    metadata: ClassVar[dict[str, Any]] = {
         "name": "violet_v1",
         "render_modes": ["human", "ansi"],
         "max_cycles": 100,
@@ -72,39 +79,40 @@ class VIOLETEnv(ParallelEnv):
 
     def __init__(
         self,
-        scenario_fn=v1_enterprise_network,
+        scenario_fn: Callable[[], Network] = v1_enterprise_network,
         max_cycles: int = 100,
-        seed: Optional[int] = None,
-    ):
+        seed: int | None = None,
+    ) -> None:
         super().__init__()
         self.scenario_fn = scenario_fn
         self.max_cycles = max_cycles
         self.seed_value = seed
-        self.rng: Optional[Any] = None
+        self.rng: Any | None = None
 
         # Episode state
-        self.network: Optional[Network] = None
-        self.transition_engine: Optional[TransitionEngine] = None
+        self.network: Network | None = None
+        self.transition_engine: TransitionEngine | None = None
         self.reward_engine: RewardEngine = RewardEngine()
         self.current_step: int = 0
-        self.agents: List[str] = [ATTACKER_AGENT, DEFENDER_AGENT]
-        self.terminations: Dict[str, bool] = {}
-        self.truncations: Dict[str, bool] = {}
-        self.rewards: Dict[str, float] = {}
-        self.observations: Dict[str, Any] = {}
-        self.infos: Dict[str, Any] = {}
-        self.events: List[Dict[str, Any]] = []
-        self.last_result: Dict[str, str] = {}
+        self.agents: list[str] = [ATTACKER_AGENT, DEFENDER_AGENT]
+        self.terminations: dict[str, bool] = {}
+        self.truncations: dict[str, bool] = {}
+        self.rewards: dict[str, float] = {}
+        self.observations: dict[str, Any] = {}
+        self.infos: dict[str, Any] = {}
+        self.events: list[dict[str, Any]] = []
+        self.last_result: dict[str, str] = {}
 
         # Build the env once per instance (used for shape inference)
         self._build_initial()
+        assert self.network is not None  # scenario_fn always constructs a network
 
         # Spaces
         n_nodes = len(self.network.nodes)
-        self.red_action_space = spaces.Discrete(len(RedActionType) * n_nodes)
-        self.blue_action_space = spaces.Discrete(len(BlueActionType) * n_nodes)
+        self.red_action_space: Any = spaces.Discrete(len(RedActionType) * n_nodes)
+        self.blue_action_space: Any = spaces.Discrete(len(BlueActionType) * n_nodes)
 
-        self._observation_spaces = {
+        self._observation_spaces: dict[str, Any] = {
             ATTACKER_AGENT: spaces.Box(low=-1.0, high=1.0, shape=(_OBS_FEATURE_DIM,), dtype=float),
             DEFENDER_AGENT: spaces.Box(low=-1.0, high=1.0, shape=(_OBS_FEATURE_DIM,), dtype=float),
         }
@@ -113,52 +121,55 @@ class VIOLETEnv(ParallelEnv):
         self.network = self.scenario_fn()
         self.transition_engine = TransitionEngine(self.network, self.reward_engine, self.seed_value)
         self.current_step = 0
-        self.terminations = {a: False for a in self.agents}
-        self.truncations = {a: False for a in self.agents}
-        self.rewards = {a: 0.0 for a in self.agents}
+        self.terminations = dict.fromkeys(self.agents, False)
+        self.truncations = dict.fromkeys(self.agents, False)
+        self.rewards = dict.fromkeys(self.agents, 0.0)
         self.infos = {a: {} for a in self.agents}
         self.events = []
-        self.last_result = {a: "" for a in self.agents}
+        self.last_result = dict.fromkeys(self.agents, "")
 
     # ------------------------------------------------------------------
     # ParallelEnv interface
     # ------------------------------------------------------------------
     def reset(
         self,
-        seed: Optional[int] = None,
-        options: Optional[Dict[str, Any]] = None,
-    ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+        seed: int | None = None,
+        options: dict[str, Any] | None = None,
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
         if seed is not None:
             self.seed_value = seed
         self._build_initial()
         self.rng = self._make_rng(self.seed_value)
         obs = self._observations()
         self.observations = obs
-        self.rewards = {a: 0.0 for a in self.agents}
+        self.rewards = dict.fromkeys(self.agents, 0.0)
         self.infos = {a: {} for a in self.agents}
         self.events = []
-        self.last_result = {a: "" for a in self.agents}
+        self.last_result = dict.fromkeys(self.agents, "")
         return obs, self.infos
 
     def step(
         self,
-        actions: Dict[str, int],
-    ) -> Tuple[
-        Dict[str, Any],
-        Dict[str, float],
-        Dict[str, bool],
-        Dict[str, bool],
-        Dict[str, Any],
+        actions: dict[str, int],
+    ) -> tuple[
+        dict[str, Any],
+        dict[str, float],
+        dict[str, bool],
+        dict[str, bool],
+        dict[str, Any],
     ]:
         if self.current_step >= self.max_cycles:
             for a in self.agents:
                 self.truncations[a] = True
-            return self.observations, self.rewards, self.terminations, self.truncations, self.infos  # type: ignore[return-value]
+            return self.observations, self.rewards, self.terminations, self.truncations, self.infos
 
         self.current_step += 1
         context = TransitionContext(step=self.current_step, timestamp=time.time())
         self.events.append({"step": self.current_step, "type": "step_start"})
 
+        assert self.transition_engine is not None and self.network is not None, (
+            "environment not initialized"
+        )
         red_action = self._decode_red_action(actions.get(ATTACKER_AGENT, 0))
         blue_action = self._decode_blue_action(actions.get(DEFENDER_AGENT, 0))
 
@@ -204,18 +215,18 @@ class VIOLETEnv(ParallelEnv):
             return self._ansi_render()
         return str(self.network.snapshot())
 
-    def observation_space(self, agent: str):
+    def observation_space(self, agent: str) -> Any:
         return self._observation_spaces[agent]
 
-    def action_space(self, agent: str):
+    def action_space(self, agent: str) -> Any:
         if agent == ATTACKER_AGENT:
             return self.red_action_space
         if agent == DEFENDER_AGENT:
             return self.blue_action_space
         raise KeyError(f"Unknown agent: {agent}")
 
-    def action_mask(self, agent: str) -> List[bool]:
-        """Validity mask over the flat action space, for masked-policy RL.
+    def action_mask(self, agent: str) -> list[bool]:
+        """Return a validity mask over the flat action space, for masked-policy RL.
 
         Encodes only HARD constraints (the flat encoding targets every node,
         but gateway nodes accept no operations). Finer-grained validity
@@ -233,7 +244,7 @@ class VIOLETEnv(ParallelEnv):
             types = list(BlueActionType)
         else:
             raise KeyError(f"Unknown agent: {agent}")
-        wait_idx = types.index([t for t in types if t.value == "WAIT"][0])
+        wait_idx = types.index(next(t for t in types if t.value == "WAIT"))
         n_types = len(types)
         mask = [False] * (len(node_ids) * n_types)
         for i, nid in enumerate(node_ids):
@@ -246,18 +257,17 @@ class VIOLETEnv(ParallelEnv):
                     mask[base + t] = True
         return mask
 
-    def agent_iter(self, max_iter: int = 2**32):
+    def agent_iter(self, max_iter: int = 2**32) -> Iterator[list[str]]:
         for _ in range(max_iter):
             yield self.agents[:]
 
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
-    def _make_rng(self, seed: Optional[int]):
-        import random
+    def _make_rng(self, seed: int | None) -> random.Random:
         return random.Random(seed) if seed is not None else random.Random()
 
-    def _decode_red_action(self, action_index: int):
+    def _decode_red_action(self, action_index: int) -> Action:
         if self.network is None:
             raise RuntimeError("Environment not initialized")
         n_nodes = max(1, len(self.network.nodes))
@@ -270,7 +280,7 @@ class VIOLETEnv(ParallelEnv):
         action_type = list(RedActionType)[action_type_idx]
         return self._make_action(ATTACKER_AGENT, action_type, target)
 
-    def _decode_blue_action(self, action_index: int):
+    def _decode_blue_action(self, action_index: int) -> Action:
         if self.network is None:
             raise RuntimeError("Environment not initialized")
         n_nodes = max(1, len(self.network.nodes))
@@ -283,15 +293,14 @@ class VIOLETEnv(ParallelEnv):
         action_type = list(BlueActionType)[action_type_idx]
         return self._make_action(DEFENDER_AGENT, action_type, target)
 
-    def _make_action(self, agent: str, action_type: Any, target: str):
-        from violet.types import Action, ActionTarget
+    def _make_action(self, agent: str, action_type: Any, target: str) -> Action:
         return Action(
             agent=agent,
             action_type=action_type,
             target=ActionTarget(node_id=target),
         )
 
-    def _reward_context(self, context: TransitionContext) -> Dict[str, Any]:
+    def _reward_context(self, context: TransitionContext) -> dict[str, Any]:
         return {
             "result": context.result,
             "detected": context.detected,
@@ -313,24 +322,23 @@ class VIOLETEnv(ParallelEnv):
         }
 
     def _terminations(self, context: TransitionContext) -> bool:
-        if self.transition_engine is None:
-            return False
+        assert self.transition_engine is not None, "environment not initialized"
         return self.transition_engine.should_terminate()
 
-    def _observations(self) -> Dict[str, Any]:
+    def _observations(self) -> dict[str, Any]:
         if self.network is None:
-            return {a: None for a in self.agents}
+            return dict.fromkeys(self.agents)
         return {
             ATTACKER_AGENT: self._red_observation(),
             DEFENDER_AGENT: self._blue_observation(),
         }
 
-    def _red_observation(self) -> List[float]:
+    def _red_observation(self) -> list[float]:
         if self.network is None:
             return [0.0] * _OBS_FEATURE_DIM
         vector = [0.0] * _OBS_FEATURE_DIM
         idx = 0
-        for nid, node in self.network.nodes.items():
+        for node in self.network.nodes.values():
             if idx >= _OBS_FEATURE_DIM:
                 break
             vector[idx] = 1.0 if node.attacker_discovered else 0.0
@@ -345,12 +353,12 @@ class VIOLETEnv(ParallelEnv):
             idx += 1
         return vector
 
-    def _blue_observation(self) -> List[float]:
+    def _blue_observation(self) -> list[float]:
         if self.network is None:
             return [0.0] * _OBS_FEATURE_DIM
         vector = [0.0] * _OBS_FEATURE_DIM
         idx = 0
-        for nid, node in self.network.nodes.items():
+        for node in self.network.nodes.values():
             if idx >= _OBS_FEATURE_DIM:
                 break
             vector[idx] = 1.0 if node.alert_level.value != "none" else 0.0

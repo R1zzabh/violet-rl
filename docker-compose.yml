@@ -1,40 +1,68 @@
-# docker-compose.yml — VIOLET
+# VIOLET's control plane and Violet Ledger training range.
+# All host ports are loopback-only. The executor, target, and target database
+# sit on internal Docker networks with no path to external systems.
 
 services:
+  range-volume-init:
+    image: alpine:3.20
+    user: "0:0"
+    command:
+      - sh
+      - -c
+      - >-
+        mkdir -p /spool/jobs /spool/processing /spool/results /spool/records /control-inbox /control-results /evidence;
+        chown -R 10001:10001 /spool && chmod 2770 /spool /spool/jobs /spool/processing /spool/results /spool/records;
+        chown -R 10001:10001 /control-inbox && chmod 2750 /control-inbox;
+        chown -R 10002:10001 /control-results /evidence && chmod 2750 /control-results /evidence
+    volumes:
+      - executor-spool:/spool
+      - target-control-inbox:/control-inbox
+      - target-control-results:/control-results
+      - target-evidence:/evidence
+    restart: "no"
+
   db:
     image: postgres:16-alpine
     environment:
       POSTGRES_USER: violet
-      POSTGRES_PASSWORD: violet_dev_password
+      POSTGRES_PASSWORD: ${VIOLET_DB_PASSWORD:?Set VIOLET_DB_PASSWORD in .env}
       POSTGRES_DB: violet
-    ports:
-      - "5432:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U violet -d violet"]
       interval: 5s
       timeout: 3s
-      retries: 5
+      retries: 10
+    networks: [control]
 
   backend:
     build:
       context: .
       dockerfile: docker/backend/Dockerfile
     environment:
-      DATABASE_URL: postgresql://violet:violet_dev_password@db:5432/violet
+      DATABASE_URL: postgresql+psycopg2://violet:${VIOLET_DB_PASSWORD:?Set VIOLET_DB_PASSWORD in .env}@db:5432/violet
       ENVIRONMENT: production
       LOG_LEVEL: info
       FRONTEND_URL: http://localhost:3000
+      VIOLET_EXECUTOR_SPOOL: /var/lib/violet/executor-spool
+      VIOLET_CONTROL_INBOX: /var/lib/violet/target-control/inbox
+      VIOLET_CONTROL_RESULTS: /var/lib/violet/target-control/results
+      VIOLET_TARGET_EVIDENCE: /var/lib/violet/target-evidence
     ports:
-      - "8000:8000"
+      - "127.0.0.1:${VIOLET_API_PORT:-8000}:8000"
     depends_on:
+      range-volume-init:
+        condition: service_completed_successfully
       db:
         condition: service_healthy
     volumes:
-      - ./experiments:/app/experiments
-      - ./artifacts:/app/artifacts
-      - ./configs:/app/configs:ro
+      - ./backend/runs:/app/runs
+      - executor-spool:/var/lib/violet/executor-spool
+      - target-control-inbox:/var/lib/violet/target-control/inbox
+      - target-control-results:/var/lib/violet/target-control/results:ro
+      - target-evidence:/var/lib/violet/target-evidence:ro
+    networks: [control, api-host]
     restart: unless-stopped
 
   frontend:
@@ -45,10 +73,108 @@ services:
       NEXT_PUBLIC_API_URL: http://localhost:8000
       PORT: 3000
     ports:
-      - "3000:3000"
+      - "127.0.0.1:${VIOLET_FRONTEND_PORT:-3000}:3000"
     depends_on:
-      - backend
+      backend:
+        condition: service_started
+    networks: [control, api-host]
+    restart: unless-stopped
+
+  target-db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: violet_target
+      POSTGRES_PASSWORD: ${TARGET_DB_PASSWORD:?Set TARGET_DB_PASSWORD in .env}
+      POSTGRES_DB: violet_target
+    volumes:
+      - target-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U violet_target -d violet_target"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    networks: [target-data]
+    mem_limit: 512m
+    pids_limit: 128
+    restart: unless-stopped
+
+  violet-ledger:
+    build:
+      context: .
+      dockerfile: docker/target/Dockerfile
+    environment:
+      TARGET_DATABASE_URL: postgresql+psycopg2://violet_target:${TARGET_DB_PASSWORD:?Set TARGET_DB_PASSWORD in .env}@target-db:5432/violet_target
+      TARGET_EVIDENCE_PATH: /var/lib/violet/evidence/target-access.jsonl
+      TARGET_CONTROL_INBOX: /control/inbox
+      TARGET_CONTROL_RESULTS: /control/results
+    depends_on:
+      range-volume-init:
+        condition: service_completed_successfully
+      target-db:
+        condition: service_healthy
+    volumes:
+      - target-control-inbox:/control/inbox:ro
+      - target-control-results:/control/results
+      - target-evidence:/var/lib/violet/evidence
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,noexec,nosuid,nodev
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    networks: [range, target-data]
+    mem_limit: 512m
+    pids_limit: 128
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8001/health', timeout=2)"
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  range-executor:
+    build:
+      context: .
+      dockerfile: docker/executor/Dockerfile
+    environment:
+      VIOLET_EXECUTOR_SPOOL: /spool
+      VIOLET_TARGET_BASE_URL: http://violet-ledger:8001
+    depends_on:
+      range-volume-init:
+        condition: service_completed_successfully
+      violet-ledger:
+        condition: service_healthy
+    volumes:
+      - executor-spool:/spool
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,noexec,nosuid,nodev
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    networks: [range]
+    mem_limit: 256m
+    pids_limit: 64
     restart: unless-stopped
 
 volumes:
   pgdata:
+  target-pgdata:
+  executor-spool:
+  target-control-inbox:
+  target-control-results:
+  target-evidence:
+
+networks:
+  control:
+    internal: true
+  api-host:
+    driver: bridge
+    driver_opts:
+      com.docker.network.bridge.enable_ip_masquerade: "false"
+  range:
+    internal: true
+  target-data:
+    internal: true

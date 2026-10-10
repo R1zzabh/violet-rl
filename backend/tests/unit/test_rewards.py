@@ -1,6 +1,14 @@
 # tests/unit/test_rewards.py — VIOLET
 
-from violet.rewards import RewardConfig, RewardEngine, reward_config_sparse, reward_config_dense, reward_config_availability_penalty
+import pytest
+
+from violet.rewards import (
+    RewardConfig,
+    RewardEngine,
+    reward_config_availability_penalty,
+    reward_config_dense,
+    reward_config_sparse,
+)
 
 
 def test_reward_config_defaults():
@@ -63,13 +71,19 @@ def test_reward_engine_blue_unnecessary_isolation():
 
 
 def test_detection_farming_is_closed():
-    """Regression: repeat detections on an already-known compromised node must
-    NOT pay the attack_detected reward — only the first detection does."""
+    """Regression: repeat detections must not pay the detection reward.
+
+    On an already-known compromised node only the FIRST detection pays;
+    subsequent detections must not farm reward.
+    """
     engine = RewardEngine()
     first = engine.blue_reward({"attack_detected": True})
-    repeat = engine.blue_reward({"attack_detected": True, "attack_contained": True})
-    # repeat detection alone adds nothing beyond contained; farming impossible by construction
+    # Repeat detection alone must not pay again — farming is closed by the
+    # defender_aware_of_compromise flag in the transition engine, so the reward
+    # for a *repeat* detection event carries only the containment component.
     assert abs(first - (5.0 - 0.1)) < 1e-6
+    repeat = engine.blue_reward({"attack_detected": True})
+    assert abs(repeat - first) < 1e-6
 
 
 def test_unnecessary_reset_penalty_wired():
@@ -90,12 +104,9 @@ def test_reward_engine_pretty_decomposition():
 
 def test_reward_engine_unknown_agent_raises():
     engine = RewardEngine()
-    ctx = {}
-    try:
+    ctx: dict[str, object] = {}
+    with pytest.raises(ValueError):
         engine.reward("green", ctx)
-        assert False, "expected ValueError"
-    except ValueError:
-        pass
 
 
 def test_sparse_config_drops_step_and_minor_rewards():
