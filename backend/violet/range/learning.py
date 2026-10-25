@@ -6,7 +6,7 @@ network destination, request body, or shell command to the executor.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Literal
 
@@ -284,6 +284,13 @@ class RangePPOAgent:
         if transition.terminated and transition.truncated:
             raise ValueError("a transition cannot be both terminated and truncated")
         self.transitions.append(transition)
+
+    def break_trace(self) -> None:
+        """Stop GAE from crossing an action that was not executed."""
+        if self.transitions:
+            previous = self.transitions[-1]
+            if not previous.terminated and not previous.truncated:
+                self.transitions[-1] = replace(previous, truncated=True)
 
     def update(self) -> dict[str, float | int]:
         """Run clipped PPO on accepted, actually executed transitions only."""

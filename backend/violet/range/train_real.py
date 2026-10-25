@@ -337,6 +337,8 @@ class RangeTrainingRunner:
             result_payload = self._job(action, run_id, episode_id, step)
             result = result_payload["result"]
             accepted = result.get("status") == "completed"
+            if not accepted and self.training:
+                self.red.break_trace()
             executed = decision.action if accepted else None
             invalid_actions += int(not accepted)
             request_count += 1
@@ -508,6 +510,8 @@ class RangeTrainingRunner:
             blue_reward = sum(blue_components.values())
             blue_return += blue_reward
             accepted_blue = blue_decision.action == 0 or control_applied
+            if not accepted_blue and self.training:
+                self.blue.break_trace()
             executed_blue = blue_decision.action if accepted_blue else None
             blue_next = RangeObservation.blue(
                 step=step + 1,

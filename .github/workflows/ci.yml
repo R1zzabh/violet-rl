@@ -21,7 +21,7 @@ jobs:
 
       - name: Install package
         working-directory: ./backend
-        run: pip install -e ".[dev]"
+        run: pip install -e ".[api,dev,rl]"
 
       - name: Lint (ruff)
         working-directory: ./backend
@@ -86,4 +86,4 @@ jobs:
       - name: Build backend image
         run: docker build -f docker/backend/Dockerfile -t violet-backend:ci .
       - name: Build frontend image
-        run: docker build -f docker/frontend/Dockerfile -t violet-frontend:ci ./frontend
+        run: docker build -f docker/frontend/Dockerfile -t violet-frontend:ci .
