@@ -52,6 +52,7 @@ export default function RootLayout({
             <Link href="/" className="ml-2 hover:text-violet-400 transition-colors">Overview</Link>
             <Link href="/simulation" className="ml-2 hover:text-violet-400 transition-colors">Simulation</Link>
             <Link href="/training" className="ml-2 hover:text-violet-400 transition-colors">Training</Link>
+            <Link href="/range-training" className="ml-2 hover:text-violet-400 transition-colors">Real Range</Link>
             <Link href="/behavior" className="ml-2 hover:text-violet-400 transition-colors">Behavior</Link>
             <Link href="/evaluation" className="ml-2 hover:text-violet-400 transition-colors">Evaluation</Link>
             <Link href="/experiments" className="ml-2 hover:text-violet-400 transition-colors">Experiments</Link>

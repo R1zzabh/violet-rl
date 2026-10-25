@@ -112,3 +112,66 @@ def test_event_sequence_survives_repository_restart_and_is_idempotent(tmp_path) 
     ]
     assert exported_results[0]["session_handle"] == "[REDACTED]"
     reopened.close()
+
+
+def test_learning_transitions_and_policy_updates_share_run_chain(tmp_path) -> None:
+    repository = EventRepository(f"sqlite:///{tmp_path / 'learning-events.sqlite3'}")
+    repository.initialize()
+    run_id = str(uuid4())
+    episode_ids = [str(uuid4()), str(uuid4())]
+    for index, episode_id in enumerate(episode_ids):
+        repository.record_learning_transition(
+            run_id=run_id,
+            episode_id=episode_id,
+            role="red",
+            seed=42 + index,
+            payload={"schema_id": "violet.range.observation.v1", "reward": 1.0},
+        )
+    repository.record_learning_update(
+        run_id=run_id,
+        episode_id=episode_ids[-1],
+        role="red",
+        seed=43,
+        payload={"policy_version": 1, "transition_count": 2, "metrics": {"loss": 0.1}},
+    )
+    events = repository.events(run_id)
+    assert [event["event_type"] for event in events] == [
+        "run_created",
+        "episode_started",
+        "learning_transition",
+        "episode_started",
+        "learning_transition",
+        "learning_policy_update",
+    ]
+    assert [event["seq"] for event in events] == list(range(1, 7))
+    assert all(
+        events[index]["previous_hash"] == events[index - 1]["event_hash"]
+        for index in range(1, len(events))
+    )
+    repository.close()
+
+
+def test_episode_result_persists_episode_and_run_completion(tmp_path) -> None:
+    repository = EventRepository(f"sqlite:///{tmp_path / 'episode-result.sqlite3'}")
+    repository.initialize()
+    run_id, episode_id = str(uuid4()), str(uuid4())
+    repository.record_learning_transition(
+        run_id=run_id,
+        episode_id=episode_id,
+        role="red",
+        seed=42,
+        payload={"observation": [0.0] * 7},
+    )
+    repository.record_episode_result(
+        run_id=run_id,
+        episode_id=episode_id,
+        seed=42,
+        episode_status="completed",
+        run_status="completed",
+        summary={"verified_attack": False, "red_return": -0.1},
+    )
+    assert repository.range_runs()[0]["status"] == "completed"
+    events = repository.events(run_id)
+    assert events[-1]["event_type"] == "episode_completed"
+    assert events[-1]["payload"]["run_status"] == "completed"
+    repository.close()

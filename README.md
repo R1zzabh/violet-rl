@@ -13,8 +13,8 @@ HTTP training range called Violet Ledger.
 | HTTP executor | A separate container accepts typed route, login, document-access, and health actions. Its destination and routes are fixed in code. |
 | Blue controls | Typed reset, ownership-hardening, actor block, and rate-limit commands reach the target through a volume queue. Ownership hardening can be verified and persisted only after Alice is denied and Bob remains served. |
 | VIOLET event storage | Range runs, episodes, typed job/control outboxes, target evidence, and hash-linked events are stored in PostgreSQL. `GET /range/runs/{run_id}/events?after_seq=N` replays the committed timeline; `scripts/export_range_run.py` writes a redacted JSONL bundle with checksums. The initial schema is created on API startup; Alembic migrations are not implemented. |
-| Range learning | Red/Blue PPO training is not connected to Violet Ledger. No learning or improvement claim is made for the real range. |
-| Dashboard | Existing pages still show the simulator. The real-range path is currently exercised through the API and smoke script. |
+| Range learning | Separate Red/Blue PPO policies train through typed executor jobs and persist transitions, verifier-based rewards, and actual PPO updates. No improvement claim is made without held-out results. |
+| Dashboard | `/range-training` shows persisted real-range runs and hash-linked event replay; it does not execute historical actions. |
 
 The local range sends HTTP requests to the Violet Ledger container only. It does
 not accept arbitrary hosts, URLs, ports, paths, request bodies, shell commands,
@@ -86,8 +86,8 @@ Executor jobs/results and target control messages use separate named volumes;
 the database outbox is reconciled into those queues after API restart. The
 initial SQLAlchemy schema is created at startup rather than managed by
 Alembic. The exporter checks the source event hash chain before writing a
-redacted JSONL timeline and SHA-256 manifest. There is not yet a frontend
-replay view or a complete typed decision/reward record.
+redacted JSONL timeline and SHA-256 manifest. The real-range dashboard reads
+the same persisted event history.
 
 ## Simulator training
 
@@ -95,6 +95,32 @@ The graph simulator and its existing training flow remain separate from the
 real HTTP range. Install the `rl` extra for PyTorch and follow the commands in
 `backend/README.md`. Simulator rewards and saved evaluations must not be
 presented as real-target results.
+
+## Initial real-range PPO runner
+
+Build the CPU-only training runtime once, then run the trainer inside Compose:
+
+```powershell
+docker compose build backend
+docker compose run --rm backend python -m violet.range.train_real --api http://backend:8000 --episodes 3 --red-steps 6 --seed 42 --run-dir runs/real_range_ppo
+```
+
+Red and Blue have separate policies. Red selects existing typed requests; Blue
+chooses no-op or ownership hardening, the only control with an independent
+verifier today. Checkpoints and an episode JSONL are saved under the run
+directory, and each transition is appended to the PostgreSQL event chain.
+Resume both policies with `--resume --red-checkpoint ... --blue-checkpoint ...`;
+use `--evaluate` with both checkpoints for deterministic inference without
+updates. Compare the four baseline pairings over identical held-out seeds with:
+
+```powershell
+docker compose run --rm backend python -m violet.range.evaluate_real --api http://backend:8000 --episodes 20 --seed 10000 --red-checkpoint runs/real_range_ppo/red.pt --blue-checkpoint runs/real_range_ppo/blue.pt
+```
+
+Open `http://localhost:3000/range-training` for persisted events and updates.
+This local HTTP experiment does not demonstrate production network effectiveness.
+See `docs/real-range-training.md` and
+`docs/rl-algorithm.md`.
 
 ## Repository map
 
@@ -110,7 +136,8 @@ presented as real-target results.
 
 ## Remaining milestones
 
-The remaining work includes Alembic migration management, role-specific Blue
-observations, evidence-derived role rewards, real-range PPO, and held-out
-co-evolution evaluation. Violet Ledger results remain descriptive until the
-learning and evaluation milestones have passed.
+Remaining work includes Alembic migration management, longer controlled
+experiments with uncertainty estimates, and diagnosis of policy quality from
+measured held-out results. The quick three-episode run validates the execution
+path and optimizer updates; it is not enough to establish learning
+improvement.

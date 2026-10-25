@@ -53,6 +53,23 @@ class EventRepository:
     def close(self) -> None:
         self.engine.dispose()
 
+    def range_runs(self, limit: int = 50) -> list[dict[str, Any]]:
+        """Return recent real-range runs for the dashboard without replaying actions."""
+        with self.sessions() as session:
+            records = session.scalars(
+                select(Run).order_by(Run.created_at.desc()).limit(limit)
+            ).all()
+            return [
+                {
+                    "run_id": run.run_id,
+                    "status": run.status,
+                    "target_version": run.target_version,
+                    "created_at": run.created_at.isoformat(),
+                    "event_count": run.next_seq - 1,
+                }
+                for run in records
+            ]
+
     @staticmethod
     def _append_event(
         session: Session,
@@ -113,7 +130,18 @@ class EventRepository:
             )
         episode = session.get(Episode, episode_id)
         if episode is None:
-            episode = Episode(episode_id=episode_id, run_id=run_id, seed=seed)
+            latest_index = session.scalar(
+                select(Episode.episode_index)
+                .where(Episode.run_id == run_id)
+                .order_by(Episode.episode_index.desc())
+                .limit(1)
+            )
+            episode = Episode(
+                episode_id=episode_id,
+                run_id=run_id,
+                episode_index=0 if latest_index is None else latest_index + 1,
+                seed=seed,
+            )
             session.add(episode)
             session.flush()
             cls._append_event(
@@ -304,7 +332,8 @@ class EventRepository:
             ).all()
             for record in records:
                 if record.payload.get("command") == "RESET" and record.acknowledgement:
-                    return int(record.acknowledgement.get("fixture_seed", 0))
+                    fixture_seed = record.acknowledgement.get("fixture_seed", 0)
+                    return fixture_seed if isinstance(fixture_seed, int) else 0
         return 0
 
     def fixture_seed(self, run_id: str, episode_id: str) -> int:
@@ -401,6 +430,84 @@ class EventRepository:
                 control.episode_id,
             )
             return verification
+
+    def record_learning_transition(
+        self,
+        *,
+        run_id: str,
+        episode_id: str,
+        role: str,
+        payload: dict[str, Any],
+        seed: int,
+    ) -> None:
+        """Append an auditable RL transition to the existing hash-linked run."""
+        with self.sessions.begin() as session:
+            run, _episode = self._ensure_run_episode(
+                session, run_id, episode_id, "violet_ledger_v1", seed=seed
+            )
+            self._append_event(
+                session,
+                run,
+                "learning_transition",
+                {"role": role, **payload},
+                episode_id,
+            )
+
+    def record_learning_update(
+        self,
+        *,
+        run_id: str,
+        episode_id: str,
+        role: str,
+        payload: dict[str, Any],
+        seed: int,
+    ) -> None:
+        """Append metrics for an optimizer update that actually ran."""
+        with self.sessions.begin() as session:
+            run, _episode = self._ensure_run_episode(
+                session, run_id, episode_id, "violet_ledger_v1", seed=seed
+            )
+            self._append_event(
+                session,
+                run,
+                "learning_policy_update",
+                {"role": role, **payload},
+                episode_id,
+            )
+
+    def record_episode_result(
+        self,
+        *,
+        run_id: str,
+        episode_id: str,
+        seed: int,
+        episode_status: str,
+        run_status: str,
+        summary: dict[str, Any],
+    ) -> None:
+        """Persist completion state after the episode's actions and PPO updates."""
+        if episode_status not in {"completed", "failed"}:
+            raise ValueError("episode status must be completed or failed")
+        if run_status not in {"running", "completed", "failed"}:
+            raise ValueError("unsupported run status")
+        with self.sessions.begin() as session:
+            run, episode = self._ensure_run_episode(
+                session, run_id, episode_id, "violet_ledger_v1", seed=seed
+            )
+            episode.status = episode_status
+            run.status = run_status
+            self._append_event(
+                session,
+                run,
+                "episode_" + episode_status,
+                {
+                    "seed": seed,
+                    "episode_status": episode_status,
+                    "run_status": run_status,
+                    **summary,
+                },
+                episode_id,
+            )
 
 
 def _parse_timestamp(value: object) -> datetime:

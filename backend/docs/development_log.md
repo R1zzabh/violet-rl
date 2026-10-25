@@ -355,3 +355,94 @@ is an acceptance slice, not a real-range learning result.
 **Next milestone:** add migration-managed persistence and Blue-visible telemetry
 with verified control outcomes before connecting either PPO policy to the real
 range.
+
+---
+
+## 2026-10-25 — Real-range PPO implementation slice
+
+**Status: IMPLEMENTED; HTTP PATH VERIFIED; PPO OPTIMIZATION UNVERIFIED**
+
+### Implemented
+- Added separate Red and Blue categorical PPO actor/critic models over
+  `violet.range.observation.v1`, with finite action catalogs, role checks,
+  stochastic training actions, deterministic inference, optimizer updates,
+  and role/schema/action-checked checkpoints.
+- Added `/range/training/transitions` and `/range/training/updates`; each
+  appends typed transition/update events into the existing run hash chain.
+- Added a real-range runner that sends all Red requests and Blue controls via
+  the existing HTTP API and typed executor. Blue is masked to no-op and
+  ownership hardening because that is the only control with the independent
+  Alice-denied/Bob-served verifier.
+- Corrected simulator GAE so terminal transitions stop value bootstrap while
+  time-limit truncations bootstrap the final value and stop the trace.
+- Added architecture, algorithm, reward, training, evaluation, and
+  troubleshooting documentation.
+
+### Verified
+- Backend suite in the Linux backend container: **87 passed, 1 skipped**. The
+  skipped module is the optional PPO-specific test, because the backend image
+  does not install the optional `rl` extra.
+- Ruff check on changed Python sources: **passed**; `compileall` and
+  `git diff --check`: **passed**.
+- Compose backend, executor, target, and databases started. The existing
+  `scripts/range_smoke.py` confirmed the seeded IDOR, then independently
+  verified Alice `403` and Bob `200` and persisted 22 ordered events.
+- Manually posted a bounded learning transition and PPO-update event to the
+  new API; replay showed `learning_transition` and
+  `learning_policy_update` in sequence.
+
+### Not verified / limitations
+- This host's Anaconda PyTorch fails to initialize with Windows error 1114
+  while loading `c10.dll`; the backend image intentionally lacks optional
+  PyTorch. Therefore the actual PPO optimizer tests, parameter-change check,
+  checkpoint load in execution, and a training run were not executed.
+- The dashboard does not expose the new training workflow. The full frontend
+  image was not built during the bounded integration check.
+- No learned-versus-baseline or held-out metrics are reported. Rate limiting
+  and actor blocking remain masked in the learning runner pending independent
+  outcome verification.
+
+See `docs/architecture-audit.md` and `docs/real-range-training.md` for current
+commands and constraints.
+
+---
+
+## 2026-10-25 — PPO runtime verification and dashboard completion
+
+**Status: PPO UPDATES AND REAL HTTP TRAINING VERIFIED; POLICY IMPROVEMENT NOT DEMONSTRATED**
+
+### Runtime and tests
+- Rebuilt `docker/backend/Dockerfile` with the declared `rl` extra and an
+  official CPU-only PyTorch wheel. The isolated Linux runtime reports Python
+  **3.12.15**, PyTorch **2.14.1+cpu**, and `(tensor([1,2])**2).sum() == 5.0`.
+- A separate Windows venv with Python **3.12.4** and PyTorch **2.14.1+cpu**
+  still fails at `c10.dll` with WinError 1114. No Anaconda packages were
+  removed or replaced.
+- Final backend suite: **108 passed, 0 failed, 0 skipped**; Ruff: **passed**.
+  Frontend TypeScript, ESLint, and Docker production build passed. The
+  `/range-training` page returned HTTP 200 from both local production serving
+  and the Compose frontend.
+
+### Training, evaluation, and persisted evidence
+- Ran three episodes at seeds 42–44, six Red decisions and six Blue decisions
+  per episode. A separately instrumented rerun recorded 18 accepted transitions
+  per role, three policy updates per role, and four optimizer steps per update
+  (12 optimizer steps per role). The event store recorded 36 transitions, six
+  policy-update events, 30 executor results, three independent control
+  verifications, three completed episode events, and a completed run status.
+  Invalid action count was zero.
+- Both checkpoints were loaded in deterministic evaluation. All decisions were
+  repeatable and the evaluation records reported zero optimizer updates. Unit
+  tests snapshot both role parameter sets around updates and verify that each
+  changes, losses/gradients stay finite, checkpoints restore, and evaluation
+  does not mutate parameters.
+- The corrected reward gives no positive Red reward for irrelevant Bob
+  authentication. In the 20-episode-per-pair held-out comparison, all four
+  pairings had 0% verified Red success and 100% Blue prevention on eligible
+  episodes. The fixture outcomes were identical, so bootstrap intervals were
+  degenerate. This demonstrates the range path and verifier, not learned
+  improvement. Raw comparison is in
+  `backend/runs/real_range_eval/comparison_reward_v2.json`.
+- Dashboard reads `GET /range/runs` and `GET /range/runs/{id}/events`; viewing
+  history does not execute past actions. Blue remains limited to no-op and
+  ownership hardening because other controls lack independent verifiers.

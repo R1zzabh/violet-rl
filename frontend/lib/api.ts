@@ -142,6 +142,22 @@ export type ScenarioDetail = {
   network: NetworkSnapshot;
 };
 
+export type RangeRun = {
+  run_id: string;
+  status: string;
+  target_version: string;
+  created_at: string;
+  event_count: number;
+};
+export type RangeEvent = {
+  run_id: string;
+  seq: number;
+  event_type: string;
+  episode_id: string | null;
+  occurred_at: string;
+  payload: Record<string, unknown>;
+};
+
 // ---------------------------------------------------------------------------
 // REST helpers — always surface a clean error; callers own the UI state.
 // ---------------------------------------------------------------------------
@@ -188,6 +204,11 @@ export const api = {
     getJson<EvalSummary>(`/evaluation/${encodeURIComponent(runId)}`),
   behavior: (runId: string) =>
     getJson<BehaviorReport>(`/behavior/${encodeURIComponent(runId)}`),
+  rangeRuns: () => getJson<{ runs: RangeRun[] }>("/range/runs"),
+  rangeEvents: (runId: string) =>
+    getJson<{ run_id: string; events: RangeEvent[] }>(
+      `/range/runs/${encodeURIComponent(runId)}/events?limit=1000`,
+    ),
   startSimulation: (params: {
     scenario_id?: string;
     red_policy?: string;

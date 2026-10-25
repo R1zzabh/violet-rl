@@ -103,7 +103,9 @@ class Transition:
     log_prob: float
     value: float
     reward: float
-    done: bool  # True on termination OR truncation (ends the trajectory)
+    terminated: bool  # True only when the task reaches an absorbing terminal state
+    truncated: bool = False  # Time limit ends the episode but permits value bootstrap
+    next_value: float = 0.0
 
 
 def compute_gae(
@@ -113,21 +115,41 @@ def compute_gae(
     next_value: float,
     gamma: float,
     gae_lambda: float,
+    truncations: list[bool] | None = None,
+    next_values: list[float] | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Generalized Advantage Estimation over one trajectory.
 
-    A dones[i]=True cuts the bootstrapping: the next value is not propagated
-    across an episode boundary (this includes truncation-at-limit, the
-    standard PPO practice — time-limit bootstrapping is a refinement deferred
-    to a later phase and noted in the dev log).
+    `dones` marks true terminal states. Time-limit truncations should be passed
+    as False so the one-step TD target bootstraps from the final observation.
     """
-    advantages = np.zeros(len(rewards), dtype=np.float32)
+    size = len(rewards)
+    if len(values) != size or len(dones) != size:
+        raise ValueError("rewards, values, and terminal flags must have equal length")
+    if truncations is not None and len(truncations) != size:
+        raise ValueError("truncation flags must match the trajectory length")
+    if next_values is not None and len(next_values) != size:
+        raise ValueError("per-transition bootstrap values must match the trajectory length")
+    if not 0.0 <= gamma <= 1.0 or not 0.0 <= gae_lambda <= 1.0:
+        raise ValueError("gamma and GAE lambda must be in [0,1]")
+    if size == 0:
+        return np.zeros(0, dtype=np.float32), np.zeros(0, dtype=np.float32)
+    if any(not np.isfinite(value) for value in (*rewards, *values, next_value)):
+        raise ValueError("trajectory rewards and values must be finite")
+    if next_values is not None and any(not np.isfinite(value) for value in next_values):
+        raise ValueError("per-transition bootstrap values must be finite")
+    advantages = np.zeros(size, dtype=np.float32)
+    truncations = truncations or [False] * len(rewards)
     last_gae = 0.0
     for t in reversed(range(len(rewards))):
-        non_terminal = 0.0 if dones[t] else 1.0
-        next_v = next_value if t == len(rewards) - 1 else values[t + 1]
-        delta = rewards[t] + gamma * next_v * non_terminal - values[t]
-        last_gae = delta + gamma * gae_lambda * non_terminal * last_gae
+        bootstrap = 0.0 if dones[t] else 1.0
+        continuation = 0.0 if dones[t] or truncations[t] else 1.0
+        if next_values is not None:
+            next_v = next_values[t]
+        else:
+            next_v = next_value if t == len(rewards) - 1 else values[t + 1]
+        delta = rewards[t] + gamma * next_v * bootstrap - values[t]
+        last_gae = delta + gamma * gae_lambda * continuation * last_gae
         advantages[t] = last_gae
     returns = advantages + np.asarray(values, dtype=np.float32)
     return advantages, returns
@@ -151,8 +173,18 @@ class RolloutBuffer:
     def finalize(self, next_value: float, gamma: float, gae_lambda: float) -> None:
         rewards = [t.reward for t in self.transitions]
         values = [t.value for t in self.transitions]
-        dones = [t.done for t in self.transitions]
-        adv, ret = compute_gae(rewards, values, dones, next_value, gamma, gae_lambda)
+        terminated = [t.terminated for t in self.transitions]
+        truncated = [t.truncated for t in self.transitions]
+        adv, ret = compute_gae(
+            rewards,
+            values,
+            terminated,
+            next_value,
+            gamma,
+            gae_lambda,
+            truncations=truncated,
+            next_values=[t.next_value for t in self.transitions],
+        )
         # Normalize advantages (standard PPO trick; harmless for single traj too)
         adv = (adv - adv.mean()) / (adv.std() + 1e-8)
         self.advantages = adv
@@ -307,6 +339,12 @@ class PPOTrainer:
             reward = float(rewards[ATTACKER_AGENT])
             done = bool(terminations[ATTACKER_AGENT] or truncations[ATTACKER_AGENT])
 
+            with torch.no_grad():
+                _, next_value = self.model.forward(
+                    torch.as_tensor(
+                        obs_next[ATTACKER_AGENT], dtype=torch.float32, device=DEVICE
+                    ).unsqueeze(0)
+                )
             self.buffer.add(
                 Transition(
                     obs=obs,
@@ -315,7 +353,9 @@ class PPOTrainer:
                     log_prob=float(log_prob.item()),
                     value=float(value.item()),
                     reward=reward,
-                    done=done,
+                    terminated=bool(terminations[ATTACKER_AGENT]),
+                    truncated=bool(truncations[ATTACKER_AGENT]),
+                    next_value=float(next_value.item()),
                 )
             )
             self.global_step += 1
