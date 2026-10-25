@@ -31,9 +31,7 @@ from violet.range.verifier import verify_document_access
 
 router = APIRouter()
 _TEMP_DIR = Path(tempfile.gettempdir())
-SPOOL = Path(
-    os.getenv("VIOLET_EXECUTOR_SPOOL", str(_TEMP_DIR / "violet-executor-spool"))
-)
+SPOOL = Path(os.getenv("VIOLET_EXECUTOR_SPOOL", str(_TEMP_DIR / "violet-executor-spool")))
 CONTROL_INBOX = Path(
     os.getenv("VIOLET_CONTROL_INBOX", str(_TEMP_DIR / "violet-target-control/inbox"))
 )
