@@ -25,10 +25,16 @@ WORKDIR /app
 # Copy the package source before installing so hatchling can build it.
 COPY backend/pyproject.toml backend/README.md ./
 COPY backend/violet ./violet
+COPY backend/.wheelhouse /tmp/torch-wheelhouse
 
 RUN pip install --upgrade pip \
-    && pip install ".[api]" \
-    && pip install ".[dev]" \
+    && if ls /tmp/torch-wheelhouse/*.whl >/dev/null 2>&1; then \
+         pip install /tmp/torch-wheelhouse/*.whl; \
+       else \
+         pip install --index-url https://download.pytorch.org/whl/cpu --extra-index-url https://pypi.org/simple "torch>=2.1"; \
+       fi \
+    && pip install ".[api,dev,rl]" \
+    && rm -rf /tmp/torch-wheelhouse \
     && rm -rf /root/.cache/pip
 
 # ---- app (tests + scripts only; package already installed above) ----

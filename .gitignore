@@ -27,6 +27,10 @@ MANIFEST
 venv/
 env/
 .venv/
+.venv-ppo/
+backend/.wheelhouse/*
+!backend/.wheelhouse/.gitkeep
+backend/.pytest-tmp/
 .ENV
 
 # Jupyter

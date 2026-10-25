@@ -3,14 +3,16 @@
 from __future__ import annotations
 
 import json
+import math
 import os
+import tempfile
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal, cast
 from uuid import UUID, uuid4
 
 from fastapi import APIRouter, HTTPException, Response
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from violet.persistence.repository import EventRepository
 from violet.range.contracts import (
@@ -28,10 +30,17 @@ from violet.range.spool import read_json, write_json_atomic
 from violet.range.verifier import verify_document_access
 
 router = APIRouter()
-SPOOL = Path(os.getenv("VIOLET_EXECUTOR_SPOOL", "/tmp/violet-executor-spool"))
-CONTROL_INBOX = Path(os.getenv("VIOLET_CONTROL_INBOX", "/tmp/violet-target-control/inbox"))
-CONTROL_RESULTS = Path(os.getenv("VIOLET_CONTROL_RESULTS", "/tmp/violet-target-control/results"))
-TARGET_EVIDENCE = Path(os.getenv("VIOLET_TARGET_EVIDENCE", "/tmp/violet-target-evidence"))
+_TEMP_DIR = Path(tempfile.gettempdir())
+SPOOL = Path(os.getenv("VIOLET_EXECUTOR_SPOOL", str(_TEMP_DIR / "violet-executor-spool")))
+CONTROL_INBOX = Path(
+    os.getenv("VIOLET_CONTROL_INBOX", str(_TEMP_DIR / "violet-target-control/inbox"))
+)
+CONTROL_RESULTS = Path(
+    os.getenv("VIOLET_CONTROL_RESULTS", str(_TEMP_DIR / "violet-target-control/results"))
+)
+TARGET_EVIDENCE = Path(
+    os.getenv("VIOLET_TARGET_EVIDENCE", str(_TEMP_DIR / "violet-target-evidence"))
+)
 _REPOSITORY: EventRepository | None = None
 
 
@@ -40,6 +49,117 @@ class ResetRequest(BaseModel):
     seed: int = Field(default=0, ge=0, le=2**31 - 1)
     run_id: UUID | None = None
     episode_id: UUID | None = None
+
+
+class LearningTransitionRequest(BaseModel):
+    """Bounded, role-scoped transition record; never accepted as an executor job."""
+
+    model_config = ConfigDict(extra="forbid")
+    run_id: UUID
+    episode_id: UUID
+    seed: int = Field(ge=0, le=2**31 - 1)
+    role: Literal["red", "blue"]
+    schema_id: Literal["violet.range.observation.v2"]
+    observation: list[float] = Field(min_length=7, max_length=8)
+    proposed_action: int = Field(ge=0, le=7)
+    action_mask: list[bool] = Field(min_length=4, max_length=8)
+    accepted: bool
+    executed_action: int | None = Field(default=None, ge=0, le=7)
+    reward: float = Field(ge=-100, le=100)
+    reward_components: dict[str, float] = Field(max_length=12)
+    next_observation: list[float] = Field(min_length=7, max_length=8)
+    next_value: float = Field(ge=-1e6, le=1e6)
+    terminated: bool
+    truncated: bool
+    policy_version: int = Field(ge=0)
+    selected_action_probability: float = Field(default=1.0, gt=0.0, le=1.0)
+    policy_entropy: float = Field(default=0.0, ge=0.0, le=3.0)
+    mode: Literal["training", "evaluation"]
+
+    @model_validator(mode="after")
+    def validate_role_contract(self) -> LearningTransitionRequest:
+        if self.terminated and self.truncated:
+            raise ValueError("transition cannot be both terminated and truncated")
+        action_count = 8 if self.role == "red" else 4
+        observation_size = 7 if self.role == "red" else 8
+        if (
+            len(self.observation) != observation_size
+            or len(self.next_observation) != observation_size
+        ):
+            raise ValueError("observation length does not match the role schema")
+        if len(self.action_mask) != action_count:
+            raise ValueError("action mask length does not match the role catalog")
+        if self.proposed_action >= action_count or not self.action_mask[self.proposed_action]:
+            raise ValueError("proposed action is outside the allowed action mask")
+        if self.accepted != (self.executed_action is not None):
+            raise ValueError("accepted transitions must identify their executed action")
+        if self.accepted and self.executed_action != self.proposed_action:
+            raise ValueError("executed action must match the validated proposal")
+        if any(not 0.0 <= value <= 1.0 for value in (*self.observation, *self.next_observation)):
+            raise ValueError("observation features must be normalized to [0,1]")
+        if any(not (-100.0 <= value <= 100.0) for value in self.reward_components.values()):
+            raise ValueError("reward components exceed the bounded range")
+        return self
+
+
+class LearningUpdateRequest(BaseModel):
+    """Metrics emitted after a non-empty PPO optimizer update."""
+
+    model_config = ConfigDict(extra="forbid")
+    run_id: UUID
+    episode_id: UUID
+    seed: int = Field(ge=0, le=2**31 - 1)
+    role: Literal["red", "blue"]
+    policy_version: int = Field(ge=1)
+    transition_count: int = Field(ge=1, le=500)
+    metrics: dict[str, float] = Field(min_length=1, max_length=12)
+
+    @model_validator(mode="after")
+    def validate_metrics(self) -> LearningUpdateRequest:
+        allowed = {
+            "loss",
+            "policy_loss",
+            "value_loss",
+            "entropy",
+            "clip_fraction",
+            "gradient_norm",
+            "optimizer_steps",
+            "advantage_mean",
+            "advantage_std",
+            "advantage_min",
+            "advantage_max",
+        }
+        if not set(self.metrics).issubset(allowed):
+            raise ValueError("unsupported PPO metric")
+        if any(not (-1e6 <= value <= 1e6) for value in self.metrics.values()):
+            raise ValueError("PPO metric is outside the finite range")
+        if not {"loss", "policy_loss", "value_loss", "entropy", "clip_fraction"}.issubset(
+            self.metrics
+        ):
+            raise ValueError("all PPO update metrics are required")
+        return self
+
+
+class EpisodeResultRequest(BaseModel):
+    """Actual episode outcome and lifecycle state for dashboard reporting."""
+
+    model_config = ConfigDict(extra="forbid")
+    run_id: UUID
+    episode_id: UUID
+    seed: int = Field(ge=0, le=2**31 - 1)
+    episode_status: Literal["completed", "failed"]
+    run_status: Literal["running", "completed", "failed"]
+    summary: dict[str, float | int | bool] = Field(max_length=16)
+
+    @model_validator(mode="after")
+    def validate_summary(self) -> EpisodeResultRequest:
+        if any(
+            isinstance(value, float) and not math.isfinite(value) for value in self.summary.values()
+        ):
+            raise ValueError("episode summary metrics must be finite")
+        if self.episode_status == "failed" and self.run_status != "failed":
+            raise ValueError("a failed episode must fail its run")
+        return self
 
 
 def _new_job(request: ExecutorJobRequest) -> ExecutorJob:
@@ -133,7 +253,7 @@ def _target_evidence(target_event_id: UUID | None) -> dict[str, Any] | None:
                 except json.JSONDecodeError:
                     continue
                 if item.get("target_event_id") == str(target_event_id):
-                    return item
+                    return cast("dict[str, Any]", item)
     except OSError:
         return None
     return None
@@ -300,6 +420,71 @@ async def get_run_events(
     return {"run_id": str(run_id), "after_seq": after_seq, "events": events}
 
 
+@router.get("/runs")
+async def list_range_runs(limit: int = 50) -> dict[str, Any]:
+    if limit < 1 or limit > 100:
+        raise HTTPException(status_code=422, detail="limit must be between 1 and 100")
+    return {"runs": _repository().range_runs(limit)}
+
+
+@router.post("/training/transitions", status_code=201)
+async def record_training_transition(request: LearningTransitionRequest) -> dict[str, str]:
+    repository = _repository()
+    try:
+        repository.record_learning_transition(
+            run_id=str(request.run_id),
+            episode_id=str(request.episode_id),
+            role=request.role,
+            payload=request.model_dump(
+                mode="json", exclude={"run_id", "episode_id", "seed", "role"}
+            ),
+            seed=request.seed,
+        )
+    except Exception:
+        raise HTTPException(
+            status_code=503, detail="learning transition could not be persisted"
+        ) from None
+    return {"status": "recorded", "episode_id": str(request.episode_id)}
+
+
+@router.post("/training/updates", status_code=201)
+async def record_learning_update(request: LearningUpdateRequest) -> dict[str, str]:
+    repository = _repository()
+    try:
+        repository.record_learning_update(
+            run_id=str(request.run_id),
+            episode_id=str(request.episode_id),
+            role=request.role,
+            payload=request.model_dump(
+                mode="json", exclude={"run_id", "episode_id", "seed", "role"}
+            ),
+            seed=request.seed,
+        )
+    except Exception:
+        raise HTTPException(
+            status_code=503, detail="learning update could not be persisted"
+        ) from None
+    return {"status": "recorded", "episode_id": str(request.episode_id)}
+
+
+@router.post("/training/episodes", status_code=201)
+async def record_episode_result(request: EpisodeResultRequest) -> dict[str, str]:
+    try:
+        _repository().record_episode_result(
+            run_id=str(request.run_id),
+            episode_id=str(request.episode_id),
+            seed=request.seed,
+            episode_status=request.episode_status,
+            run_status=request.run_status,
+            summary=request.summary,
+        )
+    except Exception:
+        raise HTTPException(
+            status_code=503, detail="episode result could not be persisted"
+        ) from None
+    return {"status": "recorded", "episode_status": request.episode_status}
+
+
 @router.post("/reset", status_code=202)
 async def reset_target(request: ResetRequest) -> dict[str, str]:
     run_id, episode_id = request.run_id or uuid4(), request.episode_id or uuid4()
@@ -361,7 +546,7 @@ async def get_control_ack(command_id: UUID) -> dict[str, Any]:
     if not path.exists():
         _reconcile_outboxes(repository)
         if persisted.get("acknowledgement") is not None:
-            return persisted["acknowledgement"]
+            return cast("dict[str, Any]", persisted["acknowledgement"])
         return {"command_id": str(command_id), "status": "queued_or_running"}
     try:
         acknowledgement = ControlAcknowledgement.model_validate(read_json(path))

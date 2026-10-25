@@ -1,3 +1,4 @@
+from typing import Literal
 from uuid import uuid4
 
 from violet.range.contracts import (
@@ -10,7 +11,9 @@ from violet.range.contracts import (
 from violet.range.control_verifier import verify_ownership_control
 
 
-def _job(run_id, episode_id, principal: str) -> tuple[ExecutorJob, ExecutorResult]:
+def _job(
+    run_id, episode_id, principal: Literal["alice", "bob"]
+) -> tuple[ExecutorJob, ExecutorResult]:
     job_id, action_id, request_id = uuid4(), uuid4(), uuid4()
     target_event_id = uuid4()
     job = ExecutorJob(

@@ -57,6 +57,7 @@ all = ["violet[rl,api,viz]", "violet[dev]"]
 
 [project.scripts]
 violet = "violet.cli:main"
+violet-range-train = "violet.range.train_real:main"
 
 [tool.hatch.build.targets.sources]
 packages = ["backend/violet"]
