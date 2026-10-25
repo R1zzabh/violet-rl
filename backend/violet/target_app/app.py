@@ -20,9 +20,7 @@ from violet.target_app.security import authenticate, read_document
 from violet.target_app.telemetry import TargetTelemetry
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator
-
-    from starlette.types import RequestResponseEndpoint
+    from collections.abc import AsyncIterator, Awaitable, Callable
 
 
 class LoginBody(BaseModel):
@@ -70,7 +68,9 @@ def create_app(
     target.state.telemetry = telemetry
 
     @target.middleware("http")
-    async def correlate_and_audit(request: Request, call_next: RequestResponseEndpoint) -> Response:
+    async def correlate_and_audit(
+        request: Request, call_next: Callable[[Request], Awaitable[Response]]
+    ) -> Response:
         started = time.monotonic()
         request_id = request.headers.get("x-violet-request-id")
         correlation = {
