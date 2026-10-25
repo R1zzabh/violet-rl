@@ -6,20 +6,23 @@ import asyncio
 import os
 import secrets
 import time
-from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager, suppress
 from pathlib import Path
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
 from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel, ConfigDict
-from starlette.types import RequestResponseEndpoint
 
 from violet.target_app.control import TargetRuntime, watch_control_directory
 from violet.target_app.database import TargetDatabase
 from violet.target_app.security import authenticate, read_document
 from violet.target_app.telemetry import TargetTelemetry
+
+if TYPE_CHECKING:
+    from collections.abc import AsyncIterator
+
+    from starlette.types import RequestResponseEndpoint
 
 
 class LoginBody(BaseModel):
