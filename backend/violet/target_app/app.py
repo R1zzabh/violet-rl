@@ -70,9 +70,7 @@ def create_app(
     target.state.telemetry = telemetry
 
     @target.middleware("http")
-    async def correlate_and_audit(
-        request: Request, call_next: RequestResponseEndpoint
-    ) -> Response:
+    async def correlate_and_audit(request: Request, call_next: RequestResponseEndpoint) -> Response:
         started = time.monotonic()
         request_id = request.headers.get("x-violet-request-id")
         correlation = {
