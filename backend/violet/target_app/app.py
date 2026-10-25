@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import os
 import secrets
+import tempfile
 import time
 from contextlib import asynccontextmanager, suppress
 from pathlib import Path
@@ -22,6 +23,8 @@ from violet.target_app.telemetry import TargetTelemetry
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Awaitable, Callable
 
+_TEMP_DIR = Path(tempfile.gettempdir())
+
 
 class LoginBody(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -37,16 +40,16 @@ def create_app(
     resolved_database_url = (
         database_url
         or os.getenv("TARGET_DATABASE_URL")
-        or "sqlite:////tmp/violet-ledger-target.sqlite3"
+        or f"sqlite:///{_TEMP_DIR / 'violet-ledger-target.sqlite3'}"
     )
     evidence_path = evidence_path or Path(
-        os.getenv("TARGET_EVIDENCE_PATH", "/tmp/violet-ledger-evidence.jsonl")
+        os.getenv("TARGET_EVIDENCE_PATH", str(_TEMP_DIR / "violet-ledger-evidence.jsonl"))
     )
     control_inbox = control_inbox or Path(
-        os.getenv("TARGET_CONTROL_INBOX", "/tmp/violet-target-control/inbox")
+        os.getenv("TARGET_CONTROL_INBOX", str(_TEMP_DIR / "violet-target-control/inbox"))
     )
     control_results = control_results or Path(
-        os.getenv("TARGET_CONTROL_RESULTS", "/tmp/violet-target-control/results")
+        os.getenv("TARGET_CONTROL_RESULTS", str(_TEMP_DIR / "violet-target-control/results"))
     )
     database = TargetDatabase(resolved_database_url)
     runtime = TargetRuntime(database)

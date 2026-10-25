@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import tempfile
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal, cast
@@ -29,10 +30,19 @@ from violet.range.spool import read_json, write_json_atomic
 from violet.range.verifier import verify_document_access
 
 router = APIRouter()
-SPOOL = Path(os.getenv("VIOLET_EXECUTOR_SPOOL", "/tmp/violet-executor-spool"))
-CONTROL_INBOX = Path(os.getenv("VIOLET_CONTROL_INBOX", "/tmp/violet-target-control/inbox"))
-CONTROL_RESULTS = Path(os.getenv("VIOLET_CONTROL_RESULTS", "/tmp/violet-target-control/results"))
-TARGET_EVIDENCE = Path(os.getenv("VIOLET_TARGET_EVIDENCE", "/tmp/violet-target-evidence"))
+_TEMP_DIR = Path(tempfile.gettempdir())
+SPOOL = Path(
+    os.getenv("VIOLET_EXECUTOR_SPOOL", str(_TEMP_DIR / "violet-executor-spool"))
+)
+CONTROL_INBOX = Path(
+    os.getenv("VIOLET_CONTROL_INBOX", str(_TEMP_DIR / "violet-target-control/inbox"))
+)
+CONTROL_RESULTS = Path(
+    os.getenv("VIOLET_CONTROL_RESULTS", str(_TEMP_DIR / "violet-target-control/results"))
+)
+TARGET_EVIDENCE = Path(
+    os.getenv("VIOLET_TARGET_EVIDENCE", str(_TEMP_DIR / "violet-target-evidence"))
+)
 _REPOSITORY: EventRepository | None = None
 
 
