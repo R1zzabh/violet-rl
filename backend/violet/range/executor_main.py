@@ -105,7 +105,9 @@ class RangeExecutor:
         self.processing_dir = spool / "processing"
         self.results_dir = spool / "results"
         self.target_base_url = validate_target_base_url(
-            target_base_url or os.getenv("VIOLET_TARGET_BASE_URL", "http://violet-ledger:8001")
+            target_base_url
+            if target_base_url is not None
+            else os.getenv("VIOLET_TARGET_BASE_URL") or "http://violet-ledger:8001"
         )
         self.sessions: dict[str, ExecutorSession] = {}
         self.transport_factory = transport_factory

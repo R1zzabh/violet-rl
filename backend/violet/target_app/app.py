@@ -6,13 +6,15 @@ import asyncio
 import os
 import secrets
 import time
+from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager, suppress
 from pathlib import Path
-from typing import Any, Literal
+from typing import Literal
 
 from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel, ConfigDict
+from starlette.types import RequestResponseEndpoint
 
 from violet.target_app.control import TargetRuntime, watch_control_directory
 from violet.target_app.database import TargetDatabase
@@ -31,8 +33,10 @@ def create_app(
     control_inbox: Path | None = None,
     control_results: Path | None = None,
 ) -> FastAPI:
-    database_url = database_url or os.getenv(
-        "TARGET_DATABASE_URL", "sqlite:////tmp/violet-ledger-target.sqlite3"
+    resolved_database_url = (
+        database_url
+        or os.getenv("TARGET_DATABASE_URL")
+        or "sqlite:////tmp/violet-ledger-target.sqlite3"
     )
     evidence_path = evidence_path or Path(
         os.getenv("TARGET_EVIDENCE_PATH", "/tmp/violet-ledger-evidence.jsonl")
@@ -43,12 +47,12 @@ def create_app(
     control_results = control_results or Path(
         os.getenv("TARGET_CONTROL_RESULTS", "/tmp/violet-target-control/results")
     )
-    database = TargetDatabase(database_url)
+    database = TargetDatabase(resolved_database_url)
     runtime = TargetRuntime(database)
     telemetry = TargetTelemetry(evidence_path)
 
     @asynccontextmanager
-    async def lifespan(_app: FastAPI):
+    async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
         task = asyncio.create_task(watch_control_directory(runtime, control_inbox, control_results))
         try:
             yield
@@ -63,7 +67,9 @@ def create_app(
     target.state.telemetry = telemetry
 
     @target.middleware("http")
-    async def correlate_and_audit(request: Request, call_next: Any) -> Response:
+    async def correlate_and_audit(
+        request: Request, call_next: RequestResponseEndpoint
+    ) -> Response:
         started = time.monotonic()
         request_id = request.headers.get("x-violet-request-id")
         correlation = {
