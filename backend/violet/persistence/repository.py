@@ -655,10 +655,41 @@ class EventRepository:
                 .with_for_update(skip_locked=True)
             ).all()
             for stale in stale_records:
+                run = self._locked_run(session, stale.training_run_id)
+                updates = session.scalars(
+                    select(TrainingUpdateRecord).where(
+                        TrainingUpdateRecord.training_run_id == stale.training_run_id,
+                        TrainingUpdateRecord.checkpoint_sha256.is_not(None),
+                    )
+                ).all()
+                # Each recorded digest names the joint Red + Blue checkpoint.
+                # One role update is enough to prove that checkpoint was made
+                # durable before the worker lease expired.
+                resumable_demo = (
+                    stale.config.get("scenario_id") == "sqli_lab_v1"
+                    and stale.config.get("campaign_label") == "live_demo_v1"
+                    and stale.mode == "train"
+                    and any(item.checkpoint_sha256 for item in updates)
+                )
+                if resumable_demo:
+                    stale.status = "queued"
+                    stale.worker_id = None
+                    stale.updated_at = utc_now()
+                    if run is not None:
+                        self._append_event(
+                            session,
+                            run,
+                            "training_worker_requeued",
+                            {
+                                "training_run_id": stale.training_run_id,
+                                "reason": "checkpoint_resume_available",
+                            },
+                            None,
+                        )
+                    continue
                 stale.status = "failed"
                 stale.result = {"error": "worker_lease_expired", "outcome": "episode_state_unknown"}
                 stale.updated_at = utc_now()
-                run = self._locked_run(session, stale.training_run_id)
                 if run is not None:
                     run.status = "failed"
                     self._append_event(
@@ -1042,7 +1073,7 @@ class EventRepository:
         self, run_id: str, after_seq: int = 0, limit: int = 10000
     ) -> list[dict[str, Any]]:
         """Return compact per-episode learning and performance records, not full traces."""
-        event_types = {"sqli_episode_summary", "sqli_ppo_update"}
+        event_types = {"sqli_episode_summary", "sqli_ppo_update", "sqli_episode_outcome"}
         with self.sessions() as session:
             records = session.scalars(
                 select(RunEvent)

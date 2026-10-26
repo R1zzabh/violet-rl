@@ -27,9 +27,11 @@ frontend ports bind to loopback.
 
 ## Real-range workflow
 
-Open `/sqli` for the SQLi lab's target status, PPO training, evaluation, and
-persisted instructor replay. Open `/range` for the preserved Ledger's typed
-manual workbench, Blue SOC, and historical training/evaluation views. SQLi
+Open `/` for the live SQLi Red/Blue training monitor and `/challenge` to run the
+latest completed joint PPO checkpoint against one disposable test phrase. The
+challenge phrase stays in volatile API/target memory and is omitted from event
+records and executor results. Open legacy `/range` and `/sqli` paths redirect
+to the two-page classroom surface. The SQLi
 training uses separate Red and Blue PPO actors, critics, optimizers, random
 streams, and policy versions. The pair stays fixed within each episode;
 accepted transitions are stored before either role updates at the boundary.
@@ -37,6 +39,13 @@ Unknown or rejected outcomes never enter PPO data. Red selects bounded action
 components that the executor composes into a request parameter; Blue acts on
 sanitized HTTP telemetry and the target applies its typed control. The no-defense
 comparator is evaluation-only.
+
+The classroom campaign uses one seed, 10,000 completed PPO-updated episodes,
+and up to 40 rounds per episode. It checkpoints the joint model and optimizer
+state after every episode, then runs 500 held-out seeded matches with the pair
+frozen. Those outcomes come from correlated target HTTP evidence and remain
+separate from training results; the run is labeled as a demonstration rather
+than a multi-seed research claim.
 
 The Ledger training flow updates separate Red and Blue policies after the same
 completed episode. Teaching runs can be short; research training

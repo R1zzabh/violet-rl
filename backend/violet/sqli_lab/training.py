@@ -8,6 +8,7 @@ import json
 import os
 import random
 import sys
+import tempfile
 import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
@@ -85,6 +86,32 @@ def _unauthorized_count(response: dict[str, Any], actor_ref: str) -> int:
     return sum(str(row.get("owner_ref")) != actor_ref for row in _row_list(response))
 
 
+def _intentional_guest_isolation(
+    result: dict[str, Any], expected_controls: dict[str, Any]
+) -> bool:
+    """Recognize the target's evidence-backed 503 from Blue's isolation control."""
+    response = _object(result.get("response"))
+    telemetry = _object(result.get("telemetry"))
+    observed_controls = _object(telemetry.get("controls"))
+    expected_version = expected_controls.get("state_version")
+    observed_version = observed_controls.get("state_version")
+    try:
+        expected_remaining = int(expected_controls.get("isolate_guest_remaining", 0))
+        observed_remaining = int(observed_controls.get("isolate_guest_remaining", -1))
+    except (TypeError, ValueError):
+        return False
+    return (
+        result.get("status") == "completed"
+        and int(result.get("http_status") or 0) == 503
+        and response.get("detail") == "temporary guest isolation"
+        and telemetry.get("evidence_status") == "verified"
+        and expected_remaining > 0
+        and observed_remaining in {0, 1}
+        and expected_version is not None
+        and observed_version == expected_version
+    )
+
+
 def _normal(value: float, denominator: float = 1.0) -> float:
     return float(np.clip(value / max(denominator, 1e-8), 0.0, 1.0))
 
@@ -105,6 +132,9 @@ class SqliEpisodeRunner:
         mode: str,
         comparator: bool = False,
         stop_check: Any = None,
+        challenge_id: UUID | None = None,
+        policy_run_id: str | None = None,
+        episode_kind: str | None = None,
     ) -> None:
         self.client = client
         self.run_id = run_id
@@ -116,6 +146,9 @@ class SqliEpisodeRunner:
         self.mode = mode
         self.comparator = comparator
         self.stop_check = stop_check
+        self.challenge_id = challenge_id
+        self.policy_run_id = policy_run_id or str(run_id)
+        self.episode_kind = episode_kind or ("training" if mode == "train" else "candidate")
         self.telemetry_history: list[dict[str, Any]] = []
         self.active_controls: dict[str, Any] = {
             "parameterized": False,
@@ -186,6 +219,11 @@ class SqliEpisodeRunner:
                 "step_id": step_id,
                 "action": action.model_dump(mode="json"),
                 "purpose": purpose,
+                "challenge_id": (
+                    str(self.challenge_id)
+                    if purpose == "policy" and self.challenge_id is not None
+                    else None
+                ),
             },
         )
         response.raise_for_status()
@@ -322,11 +360,50 @@ class SqliEpisodeRunner:
                 "reward_schema_id": REWARD_SCHEMA,
                 "target_fixture_set": "synthetic_records.v1",
                 "comparator": "no_defense_control" if self.comparator else None,
+                "episode_kind": self.episode_kind,
+                "challenge_id": str(self.challenge_id) if self.challenge_id else None,
+                "checkpoint_run_id": self.policy_run_id,
+                "policy_versions": {
+                    "red": self.red_policy.policy_version,
+                    "blue": self.blue_policy.policy_version if self.blue_policy else None,
+                },
             },
         )
         reset = await self._control("RESET", None)
         if reset.get("status") != "applied":
-            return {"status": "incomplete", "reason": "target_reset_unknown", "trace": []}
+            summary = {
+                "schema_id": "sqli.episode_outcome.v2",
+                "episode_id": str(self.episode_id),
+                "seed": self.seed,
+                "status": "incomplete",
+                "reason": "target_reset_unknown",
+                "kind": self.episode_kind,
+                "winner": None,
+                "steps": 0,
+                "verified_exposure": False,
+                "challenge_disclosed": False,
+                "exposure_verification": {"status": "incomplete", "evidence_verified": False},
+                "legitimate_query_served": False,
+                "legitimate_query_availability": None,
+                "red_return": 0.0,
+                "blue_return": 0.0,
+                "policy_versions": {
+                    "red": self.red_policy.policy_version,
+                    "blue": self.blue_policy.policy_version if self.blue_policy else None,
+                },
+                "target_version": TARGET_VERSION,
+            }
+            await self._event("sqli_episode_summary", summary)
+            await self._event(
+                "sqli_episode_outcome",
+                {"phase": self.episode_kind, **summary, "checkpoint_run_id": self.policy_run_id},
+            )
+            finish = await self.client.post(
+                f"/range/runs/{self.run_id}/episodes/{self.episode_id}/finish",
+                json={"status": "incomplete", "reason": "target_reset_unknown"},
+            )
+            finish.raise_for_status()
+            return {"status": "incomplete", "reason": "target_reset_unknown", "trace": [], "summary": summary}
 
         trace: list[dict[str, Any]] = []
         terminal_status = "completed"
@@ -346,7 +423,7 @@ class SqliEpisodeRunner:
                 "sqli_red_decision",
                 {
                     "decision_id": str(red_decision_id),
-                    "policy_id": f"red-ppo-{self.run_id}",
+                    "policy_id": f"red-ppo-{self.policy_run_id}",
                     "policy_role": "red",
                     "observation": red_observation.model_dump(mode="json"),
                     "feature_names": list(FEATURES["red"]),
@@ -369,10 +446,29 @@ class SqliEpisodeRunner:
             red_result = await self._job(red_action, red_decision_id, step_id, "policy")
             await self._request_event(red_result, purpose="policy", step_id=step_id)
             red_response = _object(red_result.get("response"))
-            unauthorized_rows = _unauthorized_count(red_response, "guest")
+            red_telemetry = _object(red_result.get("telemetry"))
+            response_unauthorized_rows = _unauthorized_count(red_response, "guest")
+            unauthorized_rows = int(red_telemetry.get("unauthorized_rows") or 0)
+            red_http_status = int(red_result.get("http_status") or 0)
+            red_isolation_applied = _intentional_guest_isolation(
+                red_result, self.active_controls
+            )
             red_accepted = (
                 red_result.get("status") == "completed"
-                and _object(red_result.get("telemetry")).get("evidence_status") == "verified"
+                and red_telemetry.get("evidence_status") == "verified"
+                and (red_http_status < 500 or red_isolation_applied)
+                and int(red_telemetry.get("unauthorized_rows") or 0)
+                == response_unauthorized_rows
+            )
+            if not red_accepted:
+                unauthorized_rows = 0
+            verified_exposure = red_accepted and unauthorized_rows > 0
+            challenge_disclosed = (
+                red_accepted
+                and self.challenge_id is not None
+                and red_telemetry.get("challenge_id") == str(self.challenge_id)
+                and bool(red_telemetry.get("challenge_disclosed"))
+                and bool(red_response.get("challenge_disclosed"))
             )
             red_components = {
                 "confirmed_unauthorized_read": float(unauthorized_rows > 0),
@@ -404,7 +500,7 @@ class SqliEpisodeRunner:
                 blue_entropy = blue_sample.entropy
                 blue_log_prob = blue_sample.old_log_probability
                 blue_indices = list(blue_sample.action_indices)
-                blue_policy_id = f"blue-ppo-{self.run_id}"
+                blue_policy_id = f"blue-ppo-{self.policy_run_id}"
             await self._event(
                 "sqli_blue_decision",
                 {
@@ -444,6 +540,13 @@ class SqliEpisodeRunner:
                 verifier_legit, purpose="verifier_legitimate", step_id=step_id
             )
             attack_response = _object(verifier_attack.get("response"))
+            attack_isolation_applied = (
+                blue_action == "ISOLATE_GUEST_LOOKUP"
+                and control_ack.get("status") == "applied"
+                and _intentional_guest_isolation(
+                    verifier_attack, _object(control_ack.get("controls"))
+                )
+            )
             legit_response = _object(verifier_legit.get("response"))
             attack_rows = _unauthorized_count(attack_response, "guest")
             legitimate_served = (
@@ -457,9 +560,14 @@ class SqliEpisodeRunner:
             attack_verified = (
                 verifier_attack.get("status") == "completed"
                 and _object(verifier_attack.get("telemetry")).get("evidence_status") == "verified"
+                and (
+                    int(verifier_attack.get("http_status") or 0) < 500
+                    or attack_isolation_applied
+                )
             )
             legit_verified = (
                 verifier_legit.get("status") == "completed"
+                and int(verifier_legit.get("http_status") or 0) < 500
                 and _object(verifier_legit.get("telemetry")).get("evidence_status") == "verified"
             )
             prevented = attack_verified and attack_rows == 0
@@ -524,6 +632,9 @@ class SqliEpisodeRunner:
                 "red_accepted": red_accepted,
                 "red_reward": red_reward,
                 "red_reward_components": red_components,
+                "verified_exposure": verified_exposure,
+                "challenge_disclosed": challenge_disclosed,
+                "response_unauthorized_rows": response_unauthorized_rows,
                 "blue_observation": blue_observation,
                 "blue_observation_array": blue_obs_array,
                 "blue_action": blue_action,
@@ -537,8 +648,14 @@ class SqliEpisodeRunner:
             trace.append(item)
             self.last_red_result = red_result
             self.last_red_action = red_action
-            if not red_accepted or not attack_verified or not legit_verified:
+            if not red_accepted or not blue_accepted or not attack_verified or not legit_verified:
                 terminal_status, reason = "incomplete", "unknown_or_unverified_outcome"
+                break
+            if challenge_disclosed:
+                reason = "verified_secret_disclosure"
+                break
+            if self.challenge_id is None and verified_exposure:
+                reason = "verified_unauthorized_read"
                 break
 
         if trace:
@@ -644,11 +761,9 @@ class SqliEpisodeRunner:
                         },
                     )
 
-        unauthorized = sum(
-            int(_unauthorized_count(_object(item["red_result"].get("response")), "guest") > 0)
-            for item in trace
-            if item["red_accepted"]
-        )
+        unauthorized = sum(int(item["verified_exposure"]) for item in trace)
+        verified_exposure = any(bool(item["verified_exposure"]) for item in trace)
+        challenge_disclosed = any(bool(item["challenge_disclosed"]) for item in trace)
         prevention_checks = [
             item["verification"] for item in trace if item["verification"]["evidence_verified"]
         ]
@@ -669,13 +784,46 @@ class SqliEpisodeRunner:
             if prevention_checks
             else None
         )
+        final_legitimate_served = bool(
+            trace
+            and trace[-1]["verification"].get("evidence_verified")
+            and trace[-1]["verification"].get("legitimate_query_served")
+        )
+        winner, winner_reason = _episode_winner(
+            status=terminal_status,
+            challenge_mode=self.challenge_id is not None,
+            challenge_disclosed=challenge_disclosed,
+            verified_exposure=verified_exposure,
+            steps=len(trace),
+            max_steps=self.max_steps,
+            final_legitimate_served=final_legitimate_served,
+        )
+        if winner_reason is not None:
+            reason = winner_reason
+        elif terminal_status == "completed":
+            terminal_status = "incomplete"
+            reason = "legitimate_access_not_verified_at_round_limit"
+        exposure_verification = {
+            "status": "verified" if any(item["red_accepted"] for item in trace) else "incomplete",
+            "evidence_verified": bool(trace) and all(item["red_accepted"] for item in trace),
+            "verified_exposure": verified_exposure,
+            "challenge_disclosed": challenge_disclosed,
+            "exposure_count": unauthorized,
+        }
         summary = {
+            "schema_id": "sqli.episode_outcome.v2",
             "episode_id": str(self.episode_id),
             "seed": self.seed,
             "status": terminal_status,
             "reason": reason,
-            "kind": "evaluation_comparator" if self.comparator else "candidate",
+            "kind": "evaluation_comparator" if self.comparator else self.episode_kind,
+            "winner": winner,
             "steps": len(trace),
+            "max_steps": self.max_steps,
+            "verified_exposure": verified_exposure,
+            "challenge_disclosed": challenge_disclosed,
+            "exposure_verification": exposure_verification,
+            "legitimate_query_served": final_legitimate_served,
             "red_return": round(sum(float(item["red_reward"]) for item in trace), 6),
             "blue_return": round(sum(float(item["blue_reward"]) for item in trace), 6),
             "unauthorized_read_rate": _normal(
@@ -685,6 +833,11 @@ class SqliEpisodeRunner:
             "legitimate_query_availability": availability_rate,
             "false_positive_rate": false_positive_rate,
             "verification_count": len(prevention_checks),
+            "policy_versions": {
+                "red": self.red_policy.policy_version,
+                "blue": self.blue_policy.policy_version if self.blue_policy else None,
+            },
+            "checkpoint_run_id": self.policy_run_id,
             "target_version": TARGET_VERSION,
             "action_schema_id": ACTION_SCHEMA,
             "reward_schema_id": REWARD_SCHEMA,
@@ -735,6 +888,27 @@ def _transition_batch(
     return result
 
 
+def _episode_winner(
+    *,
+    status: str,
+    challenge_mode: bool,
+    challenge_disclosed: bool,
+    verified_exposure: bool,
+    steps: int,
+    max_steps: int,
+    final_legitimate_served: bool,
+) -> tuple[str | None, str | None]:
+    """Return a winner only when the corresponding target evidence is verified."""
+    if status != "completed":
+        return None, None
+    if (challenge_mode and challenge_disclosed) or (not challenge_mode and verified_exposure):
+        reason = "verified_secret_disclosure" if challenge_mode else "verified_unauthorized_read"
+        return "red", reason
+    if steps == max_steps and final_legitimate_served:
+        return "blue", f"{max_steps}_rounds_without_disclosure"
+    return None, None
+
+
 def _save_checkpoint(
     path: Path,
     *,
@@ -747,33 +921,49 @@ def _save_checkpoint(
     blue_updates: int,
 ) -> str:
     path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(
-        {
-            "format": "sqli.joint_ppo.v1",
-            "scenario_id": SCENARIO_ID,
-            "target_version": TARGET_VERSION,
-            "observation_schema_id": OBSERVATION_SCHEMA,
-            "feature_schema_id": FEATURE_SCHEMA,
-            "action_schema_id": ACTION_SCHEMA,
-            "reward_schema_id": REWARD_SCHEMA,
-            "red_component_catalog": {key: list(value) for key, value in RED_COMPONENTS.items()},
-            "blue_action_catalog": list(BLUE_ACTIONS),
-            "training_run_id": training_id,
-            "seed": seed,
-            "episode_count": episode_count,
-            "policy_versions": {"red": red.policy_version, "blue": blue.policy_version},
-            "update_counts": {"red": red_updates, "blue": blue_updates},
-            "model_state_dicts": {"red": red.model.state_dict(), "blue": blue.model.state_dict()},
-            "optimizer_state_dicts": {
-                "red": red.optimizer.state_dict(),
-                "blue": blue.optimizer.state_dict(),
-            },
-            "torch_version": str(torch.__version__),
-            "numpy_version": np.__version__,
-            "python_version": sys.version.split()[0],
+    payload = {
+        "format": "sqli.joint_ppo.v1",
+        "scenario_id": SCENARIO_ID,
+        "target_version": TARGET_VERSION,
+        "observation_schema_id": OBSERVATION_SCHEMA,
+        "feature_schema_id": FEATURE_SCHEMA,
+        "action_schema_id": ACTION_SCHEMA,
+        "reward_schema_id": REWARD_SCHEMA,
+        "red_component_catalog": {key: list(value) for key, value in RED_COMPONENTS.items()},
+        "blue_action_catalog": list(BLUE_ACTIONS),
+        "training_run_id": training_id,
+        "seed": seed,
+        "episode_count": episode_count,
+        "policy_versions": {"red": red.policy_version, "blue": blue.policy_version},
+        "update_counts": {"red": red_updates, "blue": blue_updates},
+        "policy_rng_states": {
+            "red": red.rng.bit_generator.state,
+            "blue": blue.rng.bit_generator.state,
         },
-        path,
-    )
+        "model_state_dicts": {"red": red.model.state_dict(), "blue": blue.model.state_dict()},
+        "optimizer_state_dicts": {
+            "red": red.optimizer.state_dict(),
+            "blue": blue.optimizer.state_dict(),
+        },
+        "torch_version": str(torch.__version__),
+        "numpy_version": np.__version__,
+        "python_version": sys.version.split()[0],
+    }
+    fd, temp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    os.close(fd)
+    temp_path = Path(temp_name)
+    try:
+        torch.save(payload, temp_path)
+        with temp_path.open("rb") as handle:
+            os.fsync(handle.fileno())
+        os.replace(temp_path, path)
+        directory_fd = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        temp_path.unlink(missing_ok=True)
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
@@ -838,6 +1028,41 @@ async def run_sqli_job(client: httpx.AsyncClient, job: dict[str, Any]) -> dict[s
     torch.manual_seed(seed)
     red = SqliPPOPolicy("red", seed=seed, learning_rate=float(config["learning_rate"]))
     blue = SqliPPOPolicy("blue", seed=seed + 1, learning_rate=float(config["learning_rate"]))
+    run_dir = ARTIFACT_ROOT / training_id
+    config_dir = run_dir / "config"
+    metrics_dir = run_dir / "metrics"
+    checkpoint_path = run_dir / "checkpoints" / "joint" / "final.pt"
+    metrics_path = metrics_dir / "training.jsonl"
+    for directory in (config_dir, metrics_dir, checkpoint_path.parent):
+        directory.mkdir(parents=True, exist_ok=True)
+    resume_episode_count = 0
+    resume_update_count = 0
+    own_checkpoint_payload: dict[str, Any] | None = None
+    if mode == "train" and config.get("campaign_label") == "live_demo_v1" and checkpoint_path.exists():
+        payload = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+        _validate_checkpoint_contract(payload)
+        if payload.get("training_run_id") != training_id or int(payload.get("seed", -1)) != seed:
+            raise ValueError("existing demonstration checkpoint does not match this training run")
+        red.model.load_state_dict(payload["model_state_dicts"]["red"], strict=True)
+        blue.model.load_state_dict(payload["model_state_dicts"]["blue"], strict=True)
+        red.optimizer.load_state_dict(payload["optimizer_state_dicts"]["red"])
+        blue.optimizer.load_state_dict(payload["optimizer_state_dicts"]["blue"])
+        red.policy_version = int(payload["policy_versions"]["red"])
+        blue.policy_version = int(payload["policy_versions"]["blue"])
+        update_counts = payload.get("update_counts") or {}
+        red.optimizer_step_count = int(update_counts.get("red", 0))
+        blue.optimizer_step_count = int(update_counts.get("blue", 0))
+        rng_states = payload.get("policy_rng_states") or {}
+        if isinstance(rng_states.get("red"), dict):
+            red.rng.bit_generator.state = rng_states["red"]
+        if isinstance(rng_states.get("blue"), dict):
+            blue.rng.bit_generator.state = rng_states["blue"]
+        resume_episode_count = int(payload.get("episode_count", 0))
+        resume_update_count = min(
+            int((payload.get("update_counts") or {}).get("red", 0)),
+            int((payload.get("update_counts") or {}).get("blue", 0)),
+        )
+        own_checkpoint_payload = payload
     source_id = config.get("checkpoint_run_id")
     if source_id:
         source_response = await client.get(f"/range/training-runs/{source_id}")
@@ -861,16 +1086,13 @@ async def run_sqli_job(client: httpx.AsyncClient, job: dict[str, Any]) -> dict[s
         blue.model.load_state_dict(payload["model_state_dicts"]["blue"], strict=True)
         red.policy_version = int(payload["policy_versions"]["red"])
         blue.policy_version = int(payload["policy_versions"]["blue"])
+        update_counts = payload.get("update_counts") or {}
+        red.optimizer_step_count = int(update_counts.get("red", 0))
+        blue.optimizer_step_count = int(update_counts.get("blue", 0))
         if mode == "train":
             red.optimizer.load_state_dict(payload["optimizer_state_dicts"]["red"])
             blue.optimizer.load_state_dict(payload["optimizer_state_dicts"]["blue"])
 
-    run_dir = ARTIFACT_ROOT / training_id
-    config_dir = run_dir / "config"
-    metrics_dir = run_dir / "metrics"
-    checkpoint_path = run_dir / "checkpoints" / "joint" / "final.pt"
-    for directory in (config_dir, metrics_dir, checkpoint_path.parent):
-        directory.mkdir(parents=True, exist_ok=True)
     (config_dir / "run.json").write_text(
         json.dumps(
             {
@@ -894,12 +1116,41 @@ async def run_sqli_job(client: httpx.AsyncClient, job: dict[str, Any]) -> dict[s
     requested = int(config["episodes"])
     max_steps = int(config["max_steps"])
     research = config.get("run_kind") == "research"
-    update_count = 0
+    update_count = resume_update_count
     episode_summaries: list[dict[str, Any]] = []
+    if metrics_path.exists():
+        with metrics_path.open(encoding="utf-8") as handle:
+            for line in handle:
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(record, dict):
+                    episode_summaries.append(record)
+    global_steps = {
+        role: sum(
+            int(((item.get("optimizer_metrics") or {}).get(role) or {}).get("sample_count", 0))
+            for item in episode_summaries
+        )
+        for role in ("red", "blue")
+    }
+    consecutive_incomplete = 0
+    for prior in reversed(episode_summaries):
+        if prior.get("status") == "completed":
+            break
+        consecutive_incomplete += 1
     candidate_scores: list[float] = []
     comparator_scores: list[float] = []
-    episode_index = 0
-    while episode_index < requested:
+    episode_index = resume_episode_count
+    max_attempts = (
+        episode_index + requested * 2
+        if research and resume_episode_count
+        else requested * 2
+        if research
+        else requested
+    )
+    completed_episodes = sum(item.get("status") == "completed" for item in episode_summaries)
+    while episode_index < max_attempts and completed_episodes < requested:
         if await _training_stop_requested(client, training_id):
             break
         candidate_episode_id = uuid4()
@@ -907,12 +1158,14 @@ async def run_sqli_job(client: httpx.AsyncClient, job: dict[str, Any]) -> dict[s
             client,
             training_uuid,
             candidate_episode_id,
-            seed=seed + episode_index,
+            seed=(seed + episode_index) % (2**31 - 1),
             max_steps=max_steps,
             red_policy=red,
             blue_policy=blue,
             mode=mode,
             stop_check=lambda: _training_stop_requested(client, training_id),
+            policy_run_id=training_id,
+            episode_kind="training" if mode == "train" else "candidate",
         )
         candidate_result = await candidate.run()
         candidate_summary = candidate_result["summary"]
@@ -922,6 +1175,9 @@ async def run_sqli_job(client: httpx.AsyncClient, job: dict[str, Any]) -> dict[s
             red_trace = candidate_result["trace"]
             red_transitions = _transition_batch(red_trace, "red", red)
             blue_transitions = _transition_batch(red_trace, "blue", blue)
+            if candidate_result["status"] != "completed":
+                red_transitions = []
+                blue_transitions = []
             # Probe the unchanged policy on the episode's original observations.
             red_reference = (
                 np.asarray(red_trace[0]["red_observation"].features, dtype=np.float32)
@@ -951,10 +1207,38 @@ async def run_sqli_job(client: httpx.AsyncClient, job: dict[str, Any]) -> dict[s
             )
             red_after = red.probabilities(red_reference)
             blue_after = blue.probabilities(blue_reference)
-            for role, before, after, reference, metrics, transitions in (
+            role_updates = (
                 ("red", red_before, red_after, red_reference, red_metrics, red_transitions),
                 ("blue", blue_before, blue_after, blue_reference, blue_metrics, blue_transitions),
-            ):
+            )
+            for role, _before, _after, _reference, _metrics, transitions in role_updates:
+                global_steps[role] += len(transitions)
+            contextual_updates = {
+                role: {
+                    **metrics,
+                    "episode_index": float(episode_index),
+                    "accepted_transitions": float(len(transitions)),
+                    "target_version": TARGET_VERSION,
+                    "observation_schema_id": OBSERVATION_SCHEMA,
+                    "action_schema_id": ACTION_SCHEMA,
+                    "reward_schema_id": REWARD_SCHEMA,
+                }
+                for role, _before, _after, _reference, metrics, transitions in role_updates
+            }
+            # Record the joint checkpoint promptly so a restarted worker can trust
+            # its digest even if it stops while emitting the larger event stream.
+            for role, _before, _after, _reference, _metrics, transitions in role_updates:
+                if transitions:
+                    await _record_update(
+                        client,
+                        training_id,
+                        role,
+                        episode_index + 1,
+                        global_steps[role],
+                        contextual_updates[role],
+                        digest,
+                    )
+            for role, before, after, reference, metrics, transitions in role_updates:
                 await candidate._event(
                     "sqli_policy_probe",
                     {
@@ -967,24 +1251,13 @@ async def run_sqli_job(client: httpx.AsyncClient, job: dict[str, Any]) -> dict[s
                         "same_reference_observation": True,
                     },
                 )
-                metrics_with_context = {
-                    **metrics,
-                    "episode_index": float(episode_index),
-                    "accepted_transitions": float(len(transitions)),
-                    "target_version": TARGET_VERSION,
-                    "observation_schema_id": OBSERVATION_SCHEMA,
-                    "action_schema_id": ACTION_SCHEMA,
-                    "reward_schema_id": REWARD_SCHEMA,
-                }
+                metrics_with_context = contextual_updates[role]
                 await candidate._event(
                     "sqli_ppo_update",
                     {
                         "role": role,
                         "update_index": episode_index + 1,
-                        "global_step": sum(
-                            len(_transition_batch(item_trace, role, red if role == "red" else blue))
-                            for item_trace in [red_trace]
-                        ),
+                        "global_step": global_steps[role],
                         "metrics": metrics_with_context,
                         "checkpoint_sha256": digest,
                         "policy_version": int(metrics["policy_version_after"]),
@@ -995,22 +1268,27 @@ async def run_sqli_job(client: httpx.AsyncClient, job: dict[str, Any]) -> dict[s
                         "algorithm": "PPO_clipped_surrogate_GAE",
                     },
                 )
-                if transitions:
-                    await _record_update(
-                        client,
-                        training_id,
-                        role,
-                        episode_index + 1,
-                        len(transitions),
-                        metrics_with_context,
-                        digest,
-                    )
             episode_entry["optimizer_metrics"] = {"red": red_metrics, "blue": blue_metrics}
             episode_entry["policy_versions"] = {
                 "red": red.policy_version,
                 "blue": blue.policy_version,
             }
             episode_entry["checkpoint_sha256"] = digest
+            episode_entry["episode_index"] = episode_index + 1
+            await candidate._event(
+                "sqli_episode_outcome",
+                {
+                    "schema_id": "sqli.episode_outcome.v2",
+                    "phase": "training",
+                    **candidate_summary,
+                    "episode_index": episode_index + 1,
+                    "checkpoint_run_id": training_id,
+                    "checkpoint_sha256": digest,
+                    "policy_versions": episode_entry["policy_versions"],
+                    "update_metrics": {"red": red_metrics, "blue": blue_metrics},
+                    "ppo_update_count": update_count,
+                },
+            )
         else:
             comparator_id = uuid4()
             comparator_blue = SqliPPOPolicy(
@@ -1022,7 +1300,7 @@ async def run_sqli_job(client: httpx.AsyncClient, job: dict[str, Any]) -> dict[s
                 client,
                 training_uuid,
                 comparator_id,
-                seed=seed + episode_index,
+                seed=(seed + episode_index) % (2**31 - 1),
                 max_steps=max_steps,
                 red_policy=red,
                 blue_policy=comparator_blue,
@@ -1053,8 +1331,48 @@ async def run_sqli_job(client: httpx.AsyncClient, job: dict[str, Any]) -> dict[s
                 candidate_scores.append(candidate_score)
                 comparator_scores.append(baseline_score)
             episode_entry["comparator_label"] = "No-defense control comparator (evaluation only)"
+            await candidate._event(
+                "sqli_episode_outcome",
+                {
+                    "schema_id": "sqli.episode_outcome.v2",
+                    "phase": "evaluation",
+                    **candidate_summary,
+                    "checkpoint_run_id": str(source_id or training_id),
+                    "update_metrics": None,
+                },
+            )
         episode_summaries.append(episode_entry)
+        if mode == "train":
+            with metrics_path.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(episode_entry, sort_keys=True) + "\n")
+                handle.flush()
+                os.fsync(handle.fileno())
         episode_index += 1
+        completed_episodes += int(candidate_summary.get("status") == "completed")
+        consecutive_incomplete = (
+            0 if candidate_summary.get("status") == "completed" else consecutive_incomplete + 1
+        )
+        if research and consecutive_incomplete >= 5:
+            break
+
+    held_out_evaluation: dict[str, Any] | None = None
+    if (
+        mode == "train"
+        and config.get("campaign_label") == "live_demo_v1"
+        and update_count >= requested
+        and not await _training_stop_requested(client, training_id)
+    ):
+        held_out_evaluation = await _run_demo_held_out_evaluation(
+            client,
+            run_id=training_uuid,
+            training_id=training_id,
+            seed=seed,
+            training_episode_count=episode_index,
+            max_steps=max_steps,
+            red=red,
+            blue=blue,
+            metrics_dir=metrics_dir,
+        )
 
     result: dict[str, Any] = {
         "scenario_id": SCENARIO_ID,
@@ -1063,20 +1381,40 @@ async def run_sqli_job(client: httpx.AsyncClient, job: dict[str, Any]) -> dict[s
         "feature_schema_id": FEATURE_SCHEMA,
         "action_schema_id": ACTION_SCHEMA,
         "reward_schema_id": REWARD_SCHEMA,
-        "episodes": episode_summaries,
+        "episodes": episode_summaries[-100:]
+        if config.get("campaign_label") == "live_demo_v1"
+        else episode_summaries,
+        "episode_summary_count": len(episode_summaries),
         "completed_episodes": sum(
             item.get("status") == "completed" and item.get("kind") != "evaluation_comparator"
             for item in episode_summaries
         ),
+        "completed_training_episodes": min(update_count, requested)
+        if mode == "train"
+        else 0,
+        "valid_ppo_updated_episodes": min(update_count, requested)
+        if mode == "train"
+        else 0,
         "requested_episodes": requested,
         "independent_training_seeds": 1 if mode == "train" else None,
         "episode_updates": update_count,
         "policy_versions": {"red": red.policy_version, "blue": blue.policy_version},
         "optimizer_metrics": {},
+        "demonstration_label": "single_seed_classroom_demo"
+        if config.get("campaign_label") == "live_demo_v1"
+        else None,
+        "held_out_evaluation": held_out_evaluation,
         "research_criteria_met": not research
         or (
             mode == "train"
-            and sum(item.get("status") == "completed" for item in episode_summaries) >= requested
+            and min(update_count, requested) >= requested
+            and (
+                config.get("campaign_label") != "live_demo_v1"
+                or (
+                    held_out_evaluation is not None
+                    and held_out_evaluation.get("status") == "completed"
+                )
+            )
         ),
         "evidence_level": "real_http_target" if episode_summaries else "no_episode_completed",
     }
@@ -1086,7 +1424,6 @@ async def run_sqli_job(client: httpx.AsyncClient, job: dict[str, Any]) -> dict[s
         digest = hashlib.sha256(checkpoint_path.read_bytes()).hexdigest()
         result["checkpoint"] = str(checkpoint_path)
         result["checkpoint_sha256"] = digest
-        metrics_path = metrics_dir / "training.jsonl"
         metrics_path.write_text(
             "".join(json.dumps(item, sort_keys=True) + "\n" for item in episode_summaries)
         )
@@ -1139,9 +1476,210 @@ async def run_sqli_job(client: httpx.AsyncClient, job: dict[str, Any]) -> dict[s
     return result
 
 
+async def run_sqli_challenge(client: httpx.AsyncClient, job: dict[str, Any]) -> dict[str, Any]:
+    """Run the latest frozen joint checkpoint against one volatile target phrase."""
+    challenge_id = UUID(str(job["challenge_id"]))
+    run_id = UUID(str(job["run_id"]))
+    episode_id = UUID(str(job["episode_id"]))
+    checkpoint_run_id = str(job["training_run_id"])
+    seed = int(job["seed"])
+    max_steps = min(40, max(1, int(job.get("max_steps", 40))))
+    source_response = await client.get(f"/range/training-runs/{checkpoint_run_id}")
+    source_response.raise_for_status()
+    source = source_response.json()
+    source_config = source.get("config") or {}
+    source_result = source.get("result") or {}
+    if (
+        source.get("status") != "completed"
+        or source.get("role") != "joint"
+        or source_config.get("scenario_id") != SCENARIO_ID
+        or source_result.get("completed_training_episodes", 0) < 10000
+    ):
+        raise ValueError("challenge checkpoint is not a completed 10,000-episode SQLi campaign")
+    checkpoint_path = ARTIFACT_ROOT / checkpoint_run_id / "checkpoints" / "joint" / "final.pt"
+    digest = hashlib.sha256(checkpoint_path.read_bytes()).hexdigest()
+    if digest != source_result.get("checkpoint_sha256"):
+        raise ValueError("challenge checkpoint digest does not match its run record")
+    payload = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+    _validate_checkpoint_contract(payload)
+    red = SqliPPOPolicy("red", seed=seed, learning_rate=3e-4)
+    blue = SqliPPOPolicy("blue", seed=seed + 1, learning_rate=3e-4)
+    red.model.load_state_dict(payload["model_state_dicts"]["red"], strict=True)
+    blue.model.load_state_dict(payload["model_state_dicts"]["blue"], strict=True)
+    red.policy_version = int(payload["policy_versions"]["red"])
+    blue.policy_version = int(payload["policy_versions"]["blue"])
+    runner = SqliEpisodeRunner(
+        client,
+        run_id,
+        episode_id,
+        seed=seed,
+        max_steps=max_steps,
+        red_policy=red,
+        blue_policy=blue,
+        mode="evaluate",
+        challenge_id=challenge_id,
+        policy_run_id=checkpoint_run_id,
+        episode_kind="challenge",
+    )
+    result = await runner.run()
+    summary = result["summary"]
+    outcome = {
+        "schema_id": "sqli.episode_outcome.v2",
+        "phase": "challenge",
+        **summary,
+        "checkpoint_run_id": checkpoint_run_id,
+        "checkpoint_sha256": digest,
+        "policy_versions": {"red": red.policy_version, "blue": blue.policy_version},
+        "update_metrics": None,
+    }
+    await runner._event("sqli_episode_outcome", outcome)
+    return {"status": summary["status"], "summary": outcome}
+
+
 async def _training_stop_requested(client: httpx.AsyncClient, training_id: str) -> bool:
     heartbeat = await client.post(f"/range/training-runs/{training_id}/heartbeat")
     heartbeat.raise_for_status()
     record = await client.get(f"/range/training-runs/{training_id}")
     record.raise_for_status()
     return bool(record.json().get("stop_requested"))
+
+
+def _demo_held_out_seeds(seed: int, training_episode_count: int, count: int) -> list[int]:
+    modulus = 2**31 - 1
+    training = {(seed + index) % modulus for index in range(training_episode_count)}
+    candidate = (seed + training_episode_count + 10_000) % modulus
+    result: list[int] = []
+    while len(result) < count:
+        if candidate not in training and candidate not in result:
+            result.append(candidate)
+        candidate = (candidate + 1) % modulus
+    return result
+
+
+async def _run_demo_held_out_evaluation(
+    client: httpx.AsyncClient,
+    *,
+    run_id: UUID,
+    training_id: str,
+    seed: int,
+    training_episode_count: int,
+    max_steps: int,
+    red: SqliPPOPolicy,
+    blue: SqliPPOPolicy,
+    metrics_dir: Path,
+) -> dict[str, Any]:
+    """Run 500 new deterministic matches with the trained pair frozen."""
+    count = 500
+    metrics_dir.mkdir(parents=True, exist_ok=True)
+    path = metrics_dir / "held_out.jsonl"
+    summaries: list[dict[str, Any]] = []
+    if path.exists():
+        with path.open(encoding="utf-8") as handle:
+            for line in handle:
+                try:
+                    item = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(item, dict):
+                    summaries.append(item)
+    seeds = _demo_held_out_seeds(seed, training_episode_count, count)
+    for match_index, match_seed in enumerate(seeds):
+        prior = [item for item in summaries if int(item.get("seed", -1)) == match_seed]
+        if any(item.get("status") == "completed" for item in prior):
+            continue
+        attempts = len(prior)
+        while attempts < 2:
+            if await _training_stop_requested(client, training_id):
+                break
+            runner = SqliEpisodeRunner(
+                client,
+                run_id,
+                uuid4(),
+                seed=match_seed,
+                max_steps=max_steps,
+                red_policy=red,
+                blue_policy=blue,
+                mode="evaluate",
+                policy_run_id=training_id,
+                episode_kind="held_out_evaluation",
+            )
+            result = await runner.run()
+            summary = {
+                **result["summary"],
+                "match_index": match_index + 1,
+                "attempt": attempts + 1,
+                "checkpoint_run_id": training_id,
+                "frozen_policy_versions": {
+                    "red": red.policy_version,
+                    "blue": blue.policy_version,
+                },
+            }
+            await runner._event(
+                "sqli_episode_outcome",
+                {
+                    "schema_id": "sqli.episode_outcome.v2",
+                    "phase": "held_out_evaluation",
+                    **summary,
+                    "pair_frozen": True,
+                    "scripted_opponents": False,
+                    "update_metrics": None,
+                },
+            )
+            summaries.append(summary)
+            with path.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(summary, sort_keys=True) + "\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            attempts += 1
+            if result["status"] == "completed":
+                break
+
+    completed_by_seed = {
+        int(item["seed"]): item
+        for item in summaries
+        if item.get("status") == "completed"
+    }
+    completed = [completed_by_seed[item] for item in seeds if item in completed_by_seed]
+    red_wins = sum(item.get("winner") == "red" for item in completed)
+    blue_wins = sum(item.get("winner") == "blue" for item in completed)
+    verified_exposures = [float(bool(item.get("verified_exposure"))) for item in completed]
+    prevention = [
+        float(item["verified_prevention_rate"])
+        for item in completed
+        if isinstance(item.get("verified_prevention_rate"), (int, float))
+    ]
+    availability = [
+        float(item["legitimate_query_availability"])
+        for item in completed
+        if isinstance(item.get("legitimate_query_availability"), (int, float))
+    ]
+    return {
+        "schema_id": "sqli.held_out_evaluation.v1",
+        "phase": "held_out_evaluation",
+        "status": "completed" if len(completed) == count else "incomplete",
+        "requested_matches": count,
+        "completed_matches": len(completed),
+        "attempted_matches": len(summaries),
+        "red_wins": red_wins,
+        "blue_wins": blue_wins,
+        "undecided_matches": len(completed) - red_wins - blue_wins,
+        "red_win_rate": red_wins / len(completed) if completed else None,
+        "blue_win_rate": blue_wins / len(completed) if completed else None,
+        "verified_exposure_rate": float(np.mean(verified_exposures)) if completed else None,
+        "verified_prevention_rate": float(np.mean(prevention)) if prevention else None,
+        "legitimate_service_availability": float(np.mean(availability)) if availability else None,
+        "mean_red_return": float(np.mean([item["red_return"] for item in completed]))
+        if completed
+        else None,
+        "mean_blue_return": float(np.mean([item["blue_return"] for item in completed]))
+        if completed
+        else None,
+        "evaluation_seed_start": seeds[0],
+        "training_seed_count": 1,
+        "claim": "single-seed demonstration; not a multi-seed research claim",
+        "checkpoint_run_id": training_id,
+        "policy_versions": {"red": red.policy_version, "blue": blue.policy_version},
+        "pair_frozen": True,
+        "scripted_opponents": False,
+        "evidence_source": "correlated target HTTP evidence",
+    }

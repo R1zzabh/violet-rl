@@ -81,6 +81,7 @@ services:
       SQLI_CONTROL_INBOX: /var/lib/violet/sqli-control/inbox
       SQLI_CONTROL_RESULTS: /var/lib/violet/sqli-control/results
       SQLI_TARGET_EVIDENCE: /var/lib/violet/sqli-evidence/events.jsonl
+      SQLI_CHALLENGE_GATEWAY_URL: http://sqli-challenge-gateway:8003
     ports:
       - "127.0.0.1:${VIOLET_API_PORT:-8000}:8000"
     depends_on:
@@ -337,6 +338,25 @@ services:
     security_opt: [no-new-privileges:true]
     networks: [sqli-range]
     mem_limit: 192m
+    pids_limit: 48
+    restart: unless-stopped
+
+  sqli-challenge-gateway:
+    image: violet-control:local
+    build:
+      context: .
+      dockerfile: docker/backend/Dockerfile
+    command: ["uvicorn", "violet.sqli_lab.challenge_gateway:app", "--host", "0.0.0.0", "--port", "8003", "--no-access-log"]
+    depends_on:
+      sqli-target:
+        condition: service_healthy
+    read_only: true
+    tmpfs:
+      - /tmp:size=8m,noexec,nosuid,nodev
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    networks: [trainer-control, sqli-range]
+    mem_limit: 128m
     pids_limit: 48
     restart: unless-stopped
 

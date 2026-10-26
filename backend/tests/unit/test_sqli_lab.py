@@ -7,18 +7,20 @@ import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy.exc import DBAPIError
 
+from violet.api.range import _find_sqli_target_event
 from violet.sqli_lab.app import create_app
 from violet.sqli_lab.contracts import BLUE_ACTIONS, SqliControlCommand, SqliRequestAction
 from violet.sqli_lab.control import SqliRuntime
 from violet.sqli_lab.database import SqliDatabase
-from violet.sqli_lab.executor_main import validate_target_url
+from violet.sqli_lab.executor_main import SqliExecutor, validate_target_url
 from violet.sqli_lab.learning import FEATURES, SqliPPOPolicy
 from violet.sqli_lab.training import (
     CHECKPOINT_CONTRACT,
+    _episode_winner,
+    _intentional_guest_isolation,
     _transition_batch,
     _validate_checkpoint_contract,
 )
-
 ATTACK = SqliRequestAction(
     field="handle",
     base_term="rhea",
@@ -109,6 +111,99 @@ def test_transition_batch_excludes_rejected_and_unknown_actions():
     assert batch[0]["truncated"] is True
 
 
+def test_outcome_rules_require_verified_red_or_forty_round_blue_evidence():
+    red = _episode_winner(
+        status="completed",
+        challenge_mode=True,
+        challenge_disclosed=True,
+        verified_exposure=True,
+        steps=7,
+        max_steps=40,
+        final_legitimate_served=True,
+    )
+    assert red == ("red", "verified_secret_disclosure")
+
+    blue = _episode_winner(
+        status="completed",
+        challenge_mode=True,
+        challenge_disclosed=False,
+        verified_exposure=False,
+        steps=40,
+        max_steps=40,
+        final_legitimate_served=True,
+    )
+    assert blue == ("blue", "40_rounds_without_disclosure")
+
+    failed_target = _episode_winner(
+        status="incomplete",
+        challenge_mode=True,
+        challenge_disclosed=False,
+        verified_exposure=False,
+        steps=40,
+        max_steps=40,
+        final_legitimate_served=True,
+    )
+    assert failed_target == (None, None)
+
+    unavailable_owner_lookup = _episode_winner(
+        status="completed",
+        challenge_mode=True,
+        challenge_disclosed=False,
+        verified_exposure=False,
+        steps=40,
+        max_steps=40,
+        final_legitimate_served=False,
+    )
+    assert unavailable_owner_lookup == (None, None)
+
+
+def test_only_verified_blue_guest_isolation_makes_http_503_an_expected_block():
+    expected_controls = {"state_version": 4, "isolate_guest_remaining": 2}
+    isolated = {
+        "status": "completed",
+        "http_status": 503,
+        "response": {"detail": "temporary guest isolation"},
+        "telemetry": {
+            "evidence_status": "verified",
+            "controls": {"state_version": 4, "isolate_guest_remaining": 1},
+        },
+    }
+    assert _intentional_guest_isolation(isolated, expected_controls)
+
+    unrelated_failure = {
+        **isolated,
+        "response": {"detail": "target unavailable"},
+    }
+    assert not _intentional_guest_isolation(unrelated_failure, expected_controls)
+
+    mismatched_version = {
+        **isolated,
+        "telemetry": {
+            **isolated["telemetry"],
+            "controls": {"state_version": 3, "isolate_guest_remaining": 1},
+        },
+    }
+    assert not _intentional_guest_isolation(mismatched_version, expected_controls)
+
+    exhausted_control = _intentional_guest_isolation(
+        isolated, {"state_version": 4, "isolate_guest_remaining": 0}
+    )
+    assert not exhausted_control
+
+
+def test_sqli_target_evidence_lookup_reads_backwards_across_large_jsonl_lines(tmp_path):
+    target_id = "recent-target-event"
+    wanted = {"target_event_id": target_id, "challenge_disclosed": True}
+    records = [
+        json.dumps(wanted, separators=(",", ":")),
+        json.dumps({"target_event_id": "later-event", "padding": "x" * 80_000}),
+    ]
+    evidence = tmp_path / "events.jsonl"
+    evidence.write_text("\n".join(records) + "\n", encoding="utf-8")
+
+    assert _find_sqli_target_event(evidence, target_id) == wanted
+
+
 def test_sqlite_fixture_database_allows_only_read_queries(tmp_path):
     database = SqliDatabase(f"sqlite:///{tmp_path / 'sqli.sqlite3'}")
     try:
@@ -191,6 +286,55 @@ def test_http_target_correlates_evidence_and_parameterization_preserves_legitima
         )
         assert legitimate.status_code == 200
         assert [row["record_ref"] for row in legitimate.json()["rows"]] == ["rec-001"]
+
+
+def test_challenge_phrase_is_volatile_and_redacted_before_executor_persistence(tmp_path):
+    evidence = tmp_path / "events.jsonl"
+    secret = "classroom-canary-482"
+    challenge_id = "challenge-volatile-1"
+    app = create_app(
+        database_url=f"sqlite:///{tmp_path / 'challenge.sqlite3'}",
+        evidence_path=evidence,
+        control_inbox=tmp_path / "control-inbox",
+        control_results=tmp_path / "control-results",
+    )
+    with TestClient(app) as client:
+        setup = client.post(
+            f"/internal/challenges/{challenge_id}", json={"phrase": secret}
+        )
+        assert setup.status_code == 200
+        assert client.get(f"/internal/challenges/{challenge_id}/phrase").json() == {
+            "phrase": secret
+        }
+
+        response = client.post(
+            "/api/lookup",
+            json={"field": "handle", "query_value": ATTACK.compose_value()},
+            headers={
+                "X-Range-Run-ID": "challenge-run",
+                "X-Range-Episode-ID": "challenge-episode",
+                "X-Range-Request-ID": "challenge-request",
+                "X-Range-Actor": "guest",
+                "X-Range-Challenge-ID": challenge_id,
+            },
+        )
+        assert response.status_code == 200
+        assert response.json()["challenge_phrase"] == secret
+        target_record = json.loads(evidence.read_text().splitlines()[-1])
+        assert target_record["challenge_disclosed"] is True
+        assert target_record["challenge_id"] == challenge_id
+        assert secret not in evidence.read_text()
+
+        redacted = SqliExecutor._redact_phrase(
+            {"detail": secret, "nested": [f"prefix-{secret}-suffix"]}, secret
+        )
+        assert redacted == {
+            "detail": "[redacted]",
+            "nested": ["prefix-[redacted]-suffix"],
+        }
+        clear = client.delete(f"/internal/challenges/{challenge_id}")
+        assert clear.status_code == 200
+        assert client.get(f"/internal/challenges/{challenge_id}/phrase").status_code == 404
 
 
 def test_target_controls_are_guest_scoped_and_independently_measurable():

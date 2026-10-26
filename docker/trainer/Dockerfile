@@ -7,10 +7,11 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 COPY backend/pyproject.toml backend/README.md ./
-COPY backend/violet ./violet
 RUN pip install --upgrade pip \
-    && pip install ".[api]" \
-    && pip install --index-url https://download.pytorch.org/whl/cpu "torch>=2.1" \
+    && pip install --index-url https://download.pytorch.org/whl/cpu "torch>=2.1"
+
+COPY backend/violet ./violet
+RUN pip install ".[api]" \
     && addgroup --system --gid 10003 trainer \
     && adduser --system --uid 10003 --ingroup trainer trainer \
     && mkdir -p /app/runs && chown -R trainer:trainer /app

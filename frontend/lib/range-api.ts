@@ -24,6 +24,24 @@ export type TrainingRun = {
   updated_at: string;
 };
 
+export type SqliChallengeSession = {
+  challenge_id: string;
+  run_id: string;
+  episode_id: string | null;
+  training_run_id: string | null;
+  status: "queued" | "preparing" | "running" | "completed" | "incomplete" | "failed";
+  created_at: string | null;
+  result: Record<string, unknown> | null;
+};
+
+export type SqliCheckpoint = {
+  training_run_id: string;
+  status: "completed";
+  created_at: string;
+  config: Record<string, unknown>;
+  result: Record<string, unknown>;
+};
+
 export type TargetStatus = {
   schema_id: string;
   target_id: string;
@@ -84,7 +102,8 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 
 export const rangeApi = {
   targetStatus: () => request<TargetStatus>("/range/target/status"),
-  trainingRuns: () => request<{ items: TrainingRun[] }>("/range/training-runs"),
+  trainingRuns: (limit = 50) => request<{ items: TrainingRun[] }>(`/range/training-runs?limit=${limit}`),
+  demoCampaign: (restart = false) => request<TrainingRun>(`/range/sqli/demo-campaign${restart ? "?restart=true" : ""}`, { method: "POST" }),
   createTrainingRun: (data: {
     role: "red" | "blue" | "joint";
     mode: "train" | "evaluate";
@@ -118,7 +137,12 @@ export const rangeApi = {
   ),
   episodes: (id: string) => request<{ run_id: string; items: { episode_id: string; episode_index: number; seed: number | null; status: string; config: Record<string, unknown> }[] }>(`/range/runs/${encodeURIComponent(id)}/episodes?limit=500`),
   episodeTimeline: (runId: string, episodeId: string) => request<{ run_id: string; episode_id: string; items: RangeEvent[] }>(`/range/runs/${encodeURIComponent(runId)}/episodes/${encodeURIComponent(episodeId)}/timeline?limit=500`),
-  sqliSummary: (id: string, afterSeq = 0) => request<{ run_id: string; after_seq: number; next_after_seq: number; items: RangeEvent[] }>(`/range/runs/${encodeURIComponent(id)}/sqli/summary?after_seq=${afterSeq}&limit=50000`),
+  sqliSummary: (id: string, afterSeq = 0, limit = 1000) => request<{ run_id: string; after_seq: number; next_after_seq: number; items: RangeEvent[] }>(`/range/runs/${encodeURIComponent(id)}/sqli/summary?after_seq=${afterSeq}&limit=${limit}`),
+  createSqliChallenge: (secretPhrase: string) => request<SqliChallengeSession>("/range/sqli/challenges", {
+    method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ secret_phrase: secretPhrase }),
+  }),
+  sqliChallenge: (id: string) => request<SqliChallengeSession>(`/range/sqli/challenges/${encodeURIComponent(id)}`),
+  sqliCheckpoint: () => request<SqliCheckpoint | null>("/range/sqli/checkpoint"),
   streamUrl: (id: string, afterSeq = 0) =>
     `${API_BASE}/range/runs/${encodeURIComponent(id)}/stream?after_seq=${afterSeq}`,
   sqliTargetStatus: () => request<SqliTargetStatus>("/range/sqli/target/status"),

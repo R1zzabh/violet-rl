@@ -7,6 +7,7 @@ import os
 import time
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 from urllib.parse import urlsplit
 from uuid import UUID
 
@@ -68,6 +69,7 @@ class SqliExecutor:
                     actor_ref="guest" if job.purpose != "verifier_legitimate" else "researcher",
                     started_at=_utc_now(),
                     started=time.monotonic(),
+                    challenge_id=job.challenge_id,
                     error_code="executor_error",
                 )
                 write_json_atomic(output, result.model_dump(mode="json"))
@@ -77,13 +79,14 @@ class SqliExecutor:
         started_at = _utc_now()
         started = time.monotonic()
         key = f"{job.run_id}:{job.episode_id}"
-        if self.counts.get(key, 0) >= 40:
+        if self.counts.get(key, 0) >= 120:
             return self._result(
                 job,
                 status="rejected",
                 actor_ref="guest" if job.purpose != "verifier_legitimate" else "researcher",
                 started_at=started_at,
                 started=started,
+                challenge_id=job.challenge_id,
                 error_code="request_budget",
             )
         self.counts[key] = self.counts.get(key, 0) + 1
@@ -96,6 +99,8 @@ class SqliExecutor:
             "X-Range-Request-ID": str(job.request_id),
             "X-Range-Actor": actor_ref,
         }
+        if job.challenge_id is not None:
+            headers["X-Range-Challenge-ID"] = str(job.challenge_id)
         async with httpx.AsyncClient(
             base_url=self.target_url,
             timeout=httpx.Timeout(4.0, connect=2.0),
@@ -107,6 +112,34 @@ class SqliExecutor:
                 await asyncio.sleep(0.05 - elapsed)
             self.last_request_at = time.monotonic()
             try:
+                challenge_phrase: str | None = None
+                if job.challenge_id is not None:
+                    secret_response = await client.get(
+                        f"/internal/challenges/{job.challenge_id}/phrase"
+                    )
+                    if secret_response.status_code != 200:
+                        return self._result(
+                            job,
+                            status="outcome_unknown",
+                            actor_ref=actor_ref,
+                            started_at=started_at,
+                            started=started,
+                            challenge_id=job.challenge_id,
+                            error_code="challenge_unavailable",
+                        )
+                    secret_body = secret_response.json()
+                    secret_value = secret_body.get("phrase") if isinstance(secret_body, dict) else None
+                    if not isinstance(secret_value, str) or not secret_value:
+                        return self._result(
+                            job,
+                            status="outcome_unknown",
+                            actor_ref=actor_ref,
+                            started_at=started_at,
+                            started=started,
+                            challenge_id=job.challenge_id,
+                            error_code="challenge_unavailable",
+                        )
+                    challenge_phrase = secret_value
                 async with asyncio.timeout(job.deadline_seconds):
                     response = await client.post("/api/lookup", json=request_body, headers=headers)
                 try:
@@ -115,6 +148,10 @@ class SqliExecutor:
                     payload = {"detail": "non-json target response"}
                 if not isinstance(payload, dict):
                     payload = {"detail": "unexpected target response"}
+                if challenge_phrase is not None:
+                    disclosed = payload.pop("challenge_phrase", None) == challenge_phrase
+                    payload = self._redact_phrase(payload, challenge_phrase)
+                    payload["challenge_disclosed"] = disclosed
                 target_event = response.headers.get("X-Sqli-Target-Event-ID")
                 return self._result(
                     job,
@@ -122,6 +159,7 @@ class SqliExecutor:
                     actor_ref=actor_ref,
                     started_at=started_at,
                     started=started,
+                    challenge_id=job.challenge_id,
                     http_status=response.status_code,
                     target_event_id=UUID(target_event) if target_event else None,
                     request={**request_body, "actor_ref": actor_ref},
@@ -134,6 +172,7 @@ class SqliExecutor:
                     actor_ref=actor_ref,
                     started_at=started_at,
                     started=started,
+                    challenge_id=job.challenge_id,
                     error_code="timeout",
                     request={**request_body, "actor_ref": actor_ref},
                 )
@@ -144,6 +183,7 @@ class SqliExecutor:
                     actor_ref=actor_ref,
                     started_at=started_at,
                     started=started,
+                    challenge_id=job.challenge_id,
                     error_code="connection_failed",
                     request={**request_body, "actor_ref": actor_ref},
                 )
@@ -154,9 +194,20 @@ class SqliExecutor:
                     actor_ref=actor_ref,
                     started_at=started_at,
                     started=started,
+                    challenge_id=job.challenge_id,
                     error_code="executor_error",
                     request={**request_body, "actor_ref": actor_ref},
                 )
+
+    @classmethod
+    def _redact_phrase(cls, value: object, phrase: str) -> Any:
+        if isinstance(value, str):
+            return value.replace(phrase, "[redacted]")
+        if isinstance(value, list):
+            return [cls._redact_phrase(item, phrase) for item in value]
+        if isinstance(value, dict):
+            return {str(key): cls._redact_phrase(item, phrase) for key, item in value.items()}
+        return value
 
     @staticmethod
     def _result(
@@ -166,6 +217,7 @@ class SqliExecutor:
         actor_ref: str,
         started_at: str,
         started: float,
+        challenge_id: UUID | None = None,
         http_status: int | None = None,
         target_event_id: UUID | None = None,
         request: dict[str, object] | None = None,
@@ -180,6 +232,7 @@ class SqliExecutor:
             step_id=job.step_id,
             request_id=job.request_id,
             purpose=job.purpose,
+            challenge_id=challenge_id,
             status=status,  # type: ignore[arg-type]
             actor_ref=actor_ref,  # type: ignore[arg-type]
             http_status=http_status,

@@ -5,11 +5,14 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import secrets
+from collections import OrderedDict
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 from uuid import UUID, uuid4
 
+import httpx
 from fastapi import APIRouter, HTTPException, Request, Response
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, model_validator
@@ -70,7 +73,18 @@ SQLI_SPOOL = Path(os.getenv("SQLI_EXECUTOR_SPOOL", "/tmp/sqli-executor-spool")) 
 SQLI_CONTROL_INBOX = Path(os.getenv("SQLI_CONTROL_INBOX", "/tmp/sqli-control/inbox"))  # nosec B108
 SQLI_CONTROL_RESULTS = Path(os.getenv("SQLI_CONTROL_RESULTS", "/tmp/sqli-control/results"))  # nosec B108
 SQLI_TARGET_EVIDENCE = Path(os.getenv("SQLI_TARGET_EVIDENCE", "/tmp/sqli-evidence/events.jsonl"))  # nosec B108
+SQLI_CHALLENGE_GATEWAY_URL = os.getenv(
+    "SQLI_CHALLENGE_GATEWAY_URL", "http://sqli-challenge-gateway:8003"
+).rstrip("/")
 _REPOSITORY: EventRepository | None = None
+SQLI_CHALLENGE_SESSIONS: dict[str, dict[str, Any]] = {}
+SQLI_CHALLENGE_LOCK = asyncio.Lock()
+DEMO_CAMPAIGN_LOCK = asyncio.Lock()
+SQLI_CHALLENGE_MAX_SESSIONS = 16
+SQLI_CHALLENGE_RETENTION_SECONDS = 24 * 60 * 60
+SQLI_CHALLENGE_ACTIVE_TTL_SECONDS = 20 * 60
+SQLI_EVIDENCE_CACHE_SIZE = 2048
+_SQLI_EVIDENCE_CACHE: OrderedDict[str, dict[str, Any]] = OrderedDict()
 
 
 class ResetRequest(BaseModel):
@@ -204,10 +218,11 @@ class TrainingRunRequest(BaseModel):
     run_kind: Literal["teaching", "research"] = "teaching"
     scenario_id: Literal["violet_ledger_v1", "sqli_lab_v1"] = "violet_ledger_v1"
     episodes: int = Field(default=1, ge=1, le=10000)
-    max_steps: int = Field(default=12, ge=1, le=12)
+    max_steps: int = Field(default=12, ge=1, le=40)
     seed: int = Field(default=17, ge=0, le=2**31 - 1)
     opponent: Literal["scripted", "random", "none"] = "scripted"
     learning_rate: float = Field(default=0.0003, gt=0, le=0.01)
+    campaign_label: Literal["live_demo_v1"] | None = None
 
     @model_validator(mode="after")
     def require_evaluation_checkpoint(self) -> TrainingRunRequest:
@@ -219,6 +234,8 @@ class TrainingRunRequest(BaseModel):
             )
         if self.scenario_id == SQLI_SCENARIO_ID and self.opponent != "none":
             raise ValueError("scripted and random policies are excluded from SQLi classroom runs")
+        if self.scenario_id != SQLI_SCENARIO_ID and self.max_steps > 12:
+            raise ValueError("the Violet Ledger episode limit remains 12 decisions")
         if self.scenario_id != SQLI_SCENARIO_ID and self.opponent == "none":
             raise ValueError("the Violet Ledger scenario requires an explicitly labeled comparator")
         if self.mode == "evaluate" and self.checkpoint_run_id is None:
@@ -269,6 +286,7 @@ class SqliEventSubmission(BaseModel):
         "sqli_policy_probe",
         "sqli_ppo_update",
         "sqli_episode_summary",
+        "sqli_episode_outcome",
     ]
     payload: dict[str, Any]
 
@@ -287,6 +305,7 @@ class SqliJobSubmission(BaseModel):
     step_id: int = Field(ge=0, le=40)
     action: SqliRequestAction
     purpose: Literal["policy", "verifier_attack", "verifier_legitimate"] = "policy"
+    challenge_id: UUID | None = None
 
 
 class SqliControlRequest(BaseModel):
@@ -295,6 +314,23 @@ class SqliControlRequest(BaseModel):
     episode_id: UUID
     decision_id: UUID | None = None
     action: Literal["RESET", "PARAMETERIZE_QUERY", "RATE_LIMIT_GUEST", "ISOLATE_GUEST_LOOKUP"]
+
+
+class SqliChallengeRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    secret_phrase: str = Field(min_length=1, max_length=96)
+
+    @model_validator(mode="after")
+    def phrase_is_not_blank(self) -> SqliChallengeRequest:
+        if not self.secret_phrase.strip():
+            raise ValueError("enter a non-empty disposable test phrase")
+        return self
+
+
+class SqliChallengeFinish(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    status: Literal["completed", "incomplete", "failed"]
+    outcome: dict[str, Any]
 
 
 def _require_trainer(request: Any) -> None:
@@ -409,43 +445,78 @@ def _sqli_telemetry(result: SqliExecutorResult) -> dict[str, object]:
     path = SQLI_TARGET_EVIDENCE
     if path.is_dir() or not path.suffix:
         path = path / "events.jsonl"
+    item = _find_sqli_target_event(path, str(result.target_event_id))
+    if item is None:
+        return {"evidence_status": "missing"}
+    if (
+        item.get("run_id") != str(result.run_id)
+        or item.get("episode_id") != str(result.episode_id)
+        or item.get("request_id") != str(result.request_id)
+        or item.get("challenge_id")
+        != (str(result.challenge_id) if result.challenge_id else None)
+    ):
+        return {"evidence_status": "correlation_mismatch"}
+    allowed = (
+        "route_id",
+        "method",
+        "actor_ref",
+        "http_status",
+        "duration_ms",
+        "field",
+        "query_length",
+        "query_syntax_signal",
+        "row_count",
+        "unauthorized_rows",
+        "query_rejected",
+        "challenge_id",
+        "challenge_disclosed",
+        "controls",
+    )
+    return {
+        "evidence_status": "verified",
+        **{key: item[key] for key in allowed if key in item},
+    }
+
+
+def _find_sqli_target_event(path: Path, target_event_id: str) -> dict[str, Any] | None:
+    cache_key = f"{path}:{target_event_id}"
+    cached = _SQLI_EVIDENCE_CACHE.get(cache_key)
+    if cached is not None:
+        _SQLI_EVIDENCE_CACHE.move_to_end(cache_key)
+        return cached
     try:
-        with path.open(encoding="utf-8") as handle:
-            for line in handle:
-                try:
-                    item = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if not isinstance(item, dict) or item.get("target_event_id") != str(
-                    result.target_event_id
-                ):
-                    continue
-                if (
-                    item.get("run_id") != str(result.run_id)
-                    or item.get("episode_id") != str(result.episode_id)
-                    or item.get("request_id") != str(result.request_id)
-                ):
-                    return {"evidence_status": "correlation_mismatch"}
-                allowed = (
-                    "route_id",
-                    "method",
-                    "actor_ref",
-                    "http_status",
-                    "duration_ms",
-                    "field",
-                    "query_length",
-                    "query_syntax_signal",
-                    "row_count",
-                    "query_rejected",
-                    "controls",
-                )
-                return {
-                    "evidence_status": "verified",
-                    **{key: item[key] for key in allowed if key in item},
-                }
+        with path.open("rb") as handle:
+            position = handle.seek(0, os.SEEK_END)
+            remaining_tail_bytes = 4 * 1024 * 1024
+            partial = b""
+            while position > 0 and remaining_tail_bytes > 0:
+                chunk_start = max(0, position - 64 * 1024)
+                handle.seek(chunk_start)
+                data = handle.read(position - chunk_start) + partial
+                lines = data.split(b"\n")
+                if chunk_start > 0:
+                    partial = lines[0]
+                    lines = lines[1:]
+                else:
+                    partial = b""
+                for line in reversed(lines):
+                    if not line:
+                        continue
+                    try:
+                        item = json.loads(line)
+                    except (json.JSONDecodeError, UnicodeDecodeError):
+                        continue
+                    if isinstance(item, dict) and item.get("target_event_id") == target_event_id:
+                        _SQLI_EVIDENCE_CACHE[cache_key] = item
+                        _SQLI_EVIDENCE_CACHE.move_to_end(cache_key)
+                        while len(_SQLI_EVIDENCE_CACHE) > SQLI_EVIDENCE_CACHE_SIZE:
+                            _SQLI_EVIDENCE_CACHE.popitem(last=False)
+                        return item
+                remaining_tail_bytes -= position - chunk_start
+                position = chunk_start
     except OSError:
-        pass
-    return {"evidence_status": "missing"}
+        return None
+    return None
 
 
 def _sync_executor_result(
@@ -831,6 +902,7 @@ async def create_training_run(request: TrainingRunRequest) -> dict[str, Any]:
         "seed": request.seed,
         "opponent": "none" if sqli else request.opponent,
         "learning_rate": request.learning_rate,
+        "campaign_label": request.campaign_label,
         "checkpoint_run_id": str(request.checkpoint_run_id) if request.checkpoint_run_id else None,
         "target_version": SQLI_TARGET_VERSION if sqli else "violet_ledger_v1",
         "observation_schema_ids": (
@@ -867,6 +939,337 @@ async def create_training_run(request: TrainingRunRequest) -> dict[str, Any]:
         )
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from None
+
+
+@router.post("/sqli/demo-campaign", status_code=202)
+async def start_demo_campaign(restart: bool = False) -> dict[str, Any]:
+    """Create or return the single-seed, 10,000-episode classroom campaign."""
+    async with DEMO_CAMPAIGN_LOCK:
+        campaigns = [
+            item
+            for item in _repository().list_training_runs(100)
+            if item.get("config", {}).get("campaign_label") == "live_demo_v1"
+            and item.get("config", {}).get("scenario_id") == SQLI_SCENARIO_ID
+        ]
+        latest = campaigns[0] if campaigns else None
+        if latest and latest["status"] in {"queued", "running"}:
+            return latest
+        if latest and latest["status"] == "completed" and not restart:
+            return latest
+        if latest and latest["status"] not in {"failed", "stopped", "completed"}:
+            return latest
+        if latest and latest["status"] in {"failed", "stopped"} and not restart:
+            return latest
+
+        health_path = SQLI_SPOOL / "health.json"
+        if not health_path.exists():
+            raise HTTPException(status_code=503, detail="the isolated SQLi target is unavailable")
+        try:
+            health = read_json(health_path)
+            updated = datetime.fromisoformat(str(health["updated_at"]))
+            target = health.get("target") or {}
+            available = (
+                (datetime.now(UTC) - updated.astimezone(UTC)).total_seconds() <= 15
+                and isinstance(target, dict)
+                and target.get("status") == "available"
+            )
+        except (OSError, KeyError, TypeError, ValueError):
+            available = False
+        if not available:
+            raise HTTPException(status_code=503, detail="the isolated SQLi target is unavailable")
+        return await create_training_run(
+            TrainingRunRequest(
+                role="joint",
+                mode="train",
+                run_kind="research",
+                scenario_id="sqli_lab_v1",
+                episodes=10000,
+                max_steps=40,
+                seed=secrets.randbelow(2**31 - 100_000),
+                opponent="none",
+                campaign_label="live_demo_v1",
+            )
+        )
+
+
+def _latest_completed_sqli_checkpoint() -> dict[str, Any] | None:
+    candidates = [
+        item
+        for item in _repository().list_training_runs(100)
+        if item.get("status") == "completed"
+        and item.get("role") == "joint"
+        and item.get("mode") == "train"
+        and item.get("config", {}).get("scenario_id") == SQLI_SCENARIO_ID
+        and item.get("config", {}).get("run_kind") == "research"
+        and int((item.get("result") or {}).get("completed_training_episodes", 0)) >= 10000
+        and (item.get("result") or {}).get("checkpoint_sha256")
+    ]
+    return candidates[0] if candidates else None
+
+
+@router.get("/sqli/checkpoint")
+async def latest_sqli_checkpoint() -> dict[str, Any] | None:
+    """Return compact checkpoint metadata without the campaign's episode array."""
+    checkpoint = _latest_completed_sqli_checkpoint()
+    if checkpoint is None:
+        return None
+    result = checkpoint.get("result") or {}
+    return {
+        "training_run_id": checkpoint["training_run_id"],
+        "status": checkpoint["status"],
+        "created_at": checkpoint.get("created_at"),
+        "config": checkpoint.get("config") or {},
+        "result": {
+            "completed_training_episodes": result.get("completed_training_episodes"),
+            "valid_ppo_updated_episodes": result.get("valid_ppo_updated_episodes"),
+            "checkpoint_sha256": result.get("checkpoint_sha256"),
+            "policy_versions": result.get("policy_versions"),
+        },
+    }
+
+
+def _challenge_public(session: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "challenge_id": session["challenge_id"],
+        "run_id": session["run_id"],
+        "episode_id": session["episode_id"],
+        "training_run_id": session["training_run_id"],
+        "status": session["status"],
+        "created_at": session["created_at"],
+        "result": session.get("result"),
+    }
+
+
+@router.post("/sqli/challenges", status_code=202)
+async def create_sqli_challenge(challenge: SqliChallengeRequest) -> dict[str, Any]:
+    checkpoint = _latest_completed_sqli_checkpoint()
+    if checkpoint is None:
+        raise HTTPException(
+            status_code=409,
+            detail="complete the 10,000-episode demonstration campaign before starting a challenge",
+        )
+    health_path = SQLI_SPOOL / "health.json"
+    if not health_path.exists():
+        raise HTTPException(status_code=503, detail="the isolated SQLi target is unavailable")
+    try:
+        health_record = read_json(health_path)
+        health_updated = datetime.fromisoformat(str(health_record["updated_at"]))
+        target = health_record.get("target") or {}
+        target_available = (
+            (datetime.now(UTC) - health_updated.astimezone(UTC)).total_seconds() <= 15
+            and isinstance(target, dict)
+            and target.get("status") == "available"
+        )
+    except (OSError, KeyError, TypeError, ValueError):
+        target_available = False
+    if not target_available:
+        raise HTTPException(status_code=503, detail="the isolated SQLi target is unavailable")
+    challenge_id = uuid4()
+    session = {
+        "challenge_id": str(challenge_id),
+        "run_id": str(challenge_id),
+        "episode_id": str(uuid4()),
+        "training_run_id": checkpoint["training_run_id"],
+        "seed": secrets.randbelow(2**31 - 100_000),
+        "max_steps": 40,
+        "status": "preparing",
+        "created_at": datetime.now(UTC).isoformat(),
+        "result": None,
+    }
+    expired_ids: list[str] = []
+    active_session_exists = False
+    async with SQLI_CHALLENGE_LOCK:
+        now = datetime.now(UTC)
+        for old_id, old_session in list(SQLI_CHALLENGE_SESSIONS.items()):
+            try:
+                created = datetime.fromisoformat(str(old_session["created_at"]))
+                age_seconds = (now - created.astimezone(UTC)).total_seconds()
+            except (KeyError, TypeError, ValueError):
+                age_seconds = SQLI_CHALLENGE_RETENTION_SECONDS + 1
+            if (
+                old_session.get("status") in {"queued", "preparing", "running"}
+                and age_seconds > SQLI_CHALLENGE_ACTIVE_TTL_SECONDS
+            ):
+                old_session["status"] = "incomplete"
+                old_session["result"] = {"reason": "challenge_session_expired"}
+                expired_ids.append(old_id)
+            if (
+                age_seconds > SQLI_CHALLENGE_RETENTION_SECONDS
+                and old_session.get("status") not in {"queued", "preparing", "running"}
+            ):
+                SQLI_CHALLENGE_SESSIONS.pop(old_id, None)
+        active_session_exists = any(
+            item.get("status") in {"queued", "preparing", "running"}
+            for item in SQLI_CHALLENGE_SESSIONS.values()
+        )
+        if not active_session_exists and len(SQLI_CHALLENGE_SESSIONS) >= SQLI_CHALLENGE_MAX_SESSIONS:
+            oldest_id = next(iter(SQLI_CHALLENGE_SESSIONS))
+            SQLI_CHALLENGE_SESSIONS.pop(oldest_id, None)
+        if not active_session_exists:
+            SQLI_CHALLENGE_SESSIONS[session["challenge_id"]] = session
+    for expired_id in expired_ids:
+        await _clear_target_challenge(expired_id)
+    if active_session_exists:
+        raise HTTPException(status_code=409, detail="a challenge session is already active")
+    try:
+        async with httpx.AsyncClient(base_url=SQLI_CHALLENGE_GATEWAY_URL, timeout=5.0) as client:
+            response = await client.post(
+                f"/challenge/{challenge_id}", json={"phrase": challenge.secret_phrase}
+            )
+            response.raise_for_status()
+            acknowledgement = response.json()
+    except (httpx.HTTPError, ValueError):
+        acknowledgement = None
+    if not isinstance(acknowledgement, dict) or acknowledgement.get("status") != "ready":
+        async with SQLI_CHALLENGE_LOCK:
+            session["status"] = "failed"
+            session["result"] = {"reason": "target_challenge_setup_failed"}
+        await _clear_target_challenge(str(challenge_id))
+        raise HTTPException(status_code=503, detail="the isolated target could not prepare this challenge")
+    async with SQLI_CHALLENGE_LOCK:
+        session["status"] = "queued"
+    return {**_challenge_public(session), "max_steps": 40}
+
+
+@router.get("/sqli/challenges/{challenge_id}")
+async def get_sqli_challenge(challenge_id: UUID) -> dict[str, Any]:
+    expired = False
+    async with SQLI_CHALLENGE_LOCK:
+        session = SQLI_CHALLENGE_SESSIONS.get(str(challenge_id))
+        if session is not None and _challenge_session_expired(session):
+            session["status"] = "incomplete"
+            session["result"] = {"reason": "challenge_session_expired"}
+            expired = True
+    if session is not None:
+        if expired:
+            await _clear_target_challenge(str(challenge_id))
+        return _challenge_public(session)
+    run = _repository().get_run(str(challenge_id))
+    if run is None or run.get("target_version") != SQLI_TARGET_VERSION:
+        raise HTTPException(status_code=404, detail="challenge session not found")
+    events = _repository().lab_summary_events(str(challenge_id), limit=50000)
+    outcome = next(
+        (
+            item["payload"]
+            for item in reversed(events)
+            if item["event_type"] == "sqli_episode_outcome"
+            and item.get("payload", {}).get("phase") == "challenge"
+        ),
+        None,
+    )
+    if outcome is not None:
+        status = outcome.get("status")
+        if status not in {"completed", "incomplete", "failed"}:
+            status = "incomplete"
+        return {
+            "challenge_id": str(challenge_id),
+            "run_id": str(challenge_id),
+            "episode_id": outcome.get("episode_id"),
+            "training_run_id": outcome.get("checkpoint_run_id"),
+            "status": status,
+            "created_at": None,
+            "result": outcome,
+        }
+    return {
+        "challenge_id": str(challenge_id),
+        "run_id": str(challenge_id),
+        "episode_id": None,
+        "training_run_id": None,
+        "status": "running",
+        "created_at": None,
+        "result": None,
+    }
+
+
+@router.post("/sqli/challenges/claim")
+async def claim_sqli_challenge(request: Request) -> dict[str, Any]:
+    _require_trainer(request)
+    async with SQLI_CHALLENGE_LOCK:
+        session = next(
+            (
+                item
+                for item in SQLI_CHALLENGE_SESSIONS.values()
+                if item["status"] == "queued"
+            ),
+            None,
+        )
+        if session is None:
+            return {"job": None}
+        session["status"] = "running"
+        return {
+            "job": {
+                "challenge_id": session["challenge_id"],
+                "run_id": session["run_id"],
+                "episode_id": session["episode_id"],
+                "training_run_id": session["training_run_id"],
+                "seed": session["seed"],
+                "max_steps": session["max_steps"],
+            }
+        }
+
+
+@router.post("/sqli/challenges/{challenge_id}/finish")
+async def finish_sqli_challenge(
+    challenge_id: UUID, submission: SqliChallengeFinish, request: Request
+) -> dict[str, Any]:
+    _require_trainer(request)
+    async with SQLI_CHALLENGE_LOCK:
+        session = SQLI_CHALLENGE_SESSIONS.get(str(challenge_id))
+        if session is None:
+            raise HTTPException(status_code=404, detail="challenge session not found")
+        safe_outcome = {
+            "schema_id": "sqli.episode_outcome.v2",
+            **submission.outcome,
+            "phase": "challenge",
+            "episode_id": str(session["episode_id"]),
+            "checkpoint_run_id": str(session["training_run_id"]),
+        }
+        existing = _repository().lab_summary_events(str(challenge_id), limit=50000)
+        has_outcome = any(
+            item["event_type"] == "sqli_episode_outcome"
+            and item.get("payload", {}).get("phase") == "challenge"
+            for item in existing
+        )
+        if not has_outcome:
+            try:
+                _repository().record_lab_event(
+                    run_id=str(challenge_id),
+                    episode_id=str(session["episode_id"]),
+                    seed=int(session["seed"]),
+                    event_id=str(uuid4()),
+                    event_type="sqli_episode_outcome",
+                    payload=safe_outcome,
+                    scenario_id=SQLI_SCENARIO_ID,
+                    target_version=SQLI_TARGET_VERSION,
+                )
+            except ValueError as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from None
+        session["status"] = submission.status
+        session["result"] = safe_outcome
+    cleared = await _clear_target_challenge(str(challenge_id))
+    session["cleanup_status"] = "cleared" if cleared else "target_ttl_cleanup_pending"
+    return _challenge_public(session)
+
+
+def _challenge_session_expired(session: dict[str, Any]) -> bool:
+    if session.get("status") not in {"queued", "preparing", "running"}:
+        return False
+    try:
+        created = datetime.fromisoformat(str(session["created_at"]))
+    except (KeyError, TypeError, ValueError):
+        return True
+    age = (datetime.now(UTC) - created.astimezone(UTC)).total_seconds()
+    return age > SQLI_CHALLENGE_ACTIVE_TTL_SECONDS
+
+
+async def _clear_target_challenge(challenge_id: str) -> bool:
+    try:
+        async with httpx.AsyncClient(base_url=SQLI_CHALLENGE_GATEWAY_URL, timeout=5.0) as client:
+            response = await client.delete(f"/challenge/{challenge_id}")
+            response.raise_for_status()
+            return True
+    except httpx.HTTPError:
+        return False
 
 
 @router.get("/training-runs")
@@ -965,6 +1368,7 @@ async def submit_sqli_job(submission: SqliJobSubmission, request: Request) -> di
         request_id=uuid4(),
         action=submission.action,
         purpose=submission.purpose,
+        challenge_id=submission.challenge_id,
     )
     SQLI_SPOOL.joinpath("jobs").mkdir(parents=True, exist_ok=True)
     write_json_atomic(SQLI_SPOOL / "jobs" / f"{job.job_id}.json", job.model_dump(mode="json"))
@@ -986,6 +1390,7 @@ async def submit_sqli_job(submission: SqliJobSubmission, request: Request) -> di
             "components": submission.action.components(),
             "composed_query_value": composed_value,
             "action_schema_id": submission.action.schema_id,
+            "challenge_id": str(job.challenge_id) if job.challenge_id else None,
         },
         scenario_id=SQLI_SCENARIO_ID,
         target_version=SQLI_TARGET_VERSION,

@@ -57,6 +57,9 @@ backend/.pytest-tmp/
 runs/
 artifacts/
 experiments/
+# Keep the app's legacy /experiments redirect despite the artifacts pattern.
+!frontend/app/experiments/
+!frontend/app/experiments/page.tsx
 *.pt
 *.pth
 *.h5

@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
-from uuid import UUID
 
 from pydantic import ValidationError
 
@@ -27,6 +27,27 @@ class SqliRuntime:
         self.isolate_guest_remaining = 0
         self.guest_requests: dict[str, int] = {}
         self.state_version = 0
+        self.challenge_secrets: dict[str, tuple[str, float]] = {}
+
+    def set_challenge(self, challenge_id: str, phrase: str, ttl_seconds: float = 900.0) -> None:
+        now = time.monotonic()
+        for expired_id, (_secret, expires_at) in list(self.challenge_secrets.items()):
+            if expires_at <= now:
+                self.challenge_secrets.pop(expired_id, None)
+        self.challenge_secrets[challenge_id] = (phrase, now + ttl_seconds)
+
+    def get_challenge(self, challenge_id: str) -> str | None:
+        item = self.challenge_secrets.get(challenge_id)
+        if item is None:
+            return None
+        phrase, expires_at = item
+        if expires_at <= time.monotonic():
+            self.challenge_secrets.pop(challenge_id, None)
+            return None
+        return phrase
+
+    def clear_challenge(self, challenge_id: str) -> None:
+        self.challenge_secrets.pop(challenge_id, None)
 
     def apply(self, command: SqliControlCommand) -> SqliControlAcknowledgement:
         if command.action == "RESET":

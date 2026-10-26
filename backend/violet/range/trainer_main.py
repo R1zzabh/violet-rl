@@ -1017,7 +1017,34 @@ async def worker() -> None:
                 response.raise_for_status()
                 job = response.json().get("job")
                 if job is None:
-                    await asyncio.sleep(2.0)
+                    challenge_response = await client.post("/range/sqli/challenges/claim")
+                    challenge_response.raise_for_status()
+                    challenge_job = challenge_response.json().get("job")
+                    if challenge_job is None:
+                        await asyncio.sleep(2.0)
+                        continue
+                    challenge_id = str(challenge_job["challenge_id"])
+                    try:
+                        from violet.sqli_lab.training import run_sqli_challenge
+
+                        result = await run_sqli_challenge(client, challenge_job)
+                        status = str(result.get("status", "incomplete"))
+                        outcome = result.get("summary") or {}
+                    except Exception as exc:
+                        status = "failed"
+                        outcome = {
+                            "schema_id": "sqli.episode_outcome.v2",
+                            "phase": "challenge",
+                            "status": "failed",
+                            "reason": type(exc).__name__,
+                            "winner": None,
+                            "checkpoint_run_id": challenge_job.get("training_run_id"),
+                        }
+                    finish_response = await client.post(
+                        f"/range/sqli/challenges/{challenge_id}/finish",
+                        json={"status": status, "outcome": outcome},
+                    )
+                    finish_response.raise_for_status()
                     continue
                 training_id = str(job["training_run_id"])
                 try:

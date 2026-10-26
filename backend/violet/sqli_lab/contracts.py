@@ -96,6 +96,7 @@ class SqliJob(StrictModel):
     request_id: UUID
     action: SqliRequestAction
     purpose: Literal["policy", "verifier_attack", "verifier_legitimate"]
+    challenge_id: UUID | None = None
     deadline_seconds: float = Field(default=4.0, gt=0, le=4.0)
 
 
@@ -108,6 +109,7 @@ class SqliExecutorResult(StrictModel):
     step_id: int = Field(ge=0, le=40)
     request_id: UUID
     purpose: Literal["policy", "verifier_attack", "verifier_legitimate"]
+    challenge_id: UUID | None = None
     status: Literal["completed", "failed", "outcome_unknown", "rejected"]
     actor_ref: Literal["guest", "researcher"]
     method: Literal["POST"] = "POST"
@@ -118,7 +120,14 @@ class SqliExecutorResult(StrictModel):
     response: dict[str, object] = Field(default_factory=dict)
     telemetry: dict[str, object] = Field(default_factory=dict)
     error_code: (
-        Literal["timeout", "connection_failed", "executor_error", "request_budget"] | None
+        Literal[
+            "timeout",
+            "connection_failed",
+            "executor_error",
+            "request_budget",
+            "challenge_unavailable",
+        ]
+        | None
     ) = None
     duration_ms: float = Field(ge=0)
     started_at: str

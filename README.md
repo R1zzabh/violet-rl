@@ -16,7 +16,7 @@ SQLi learning lab and the preserved Violet Ledger IDOR range.
 | VIOLET event storage | Range jobs, full policy samples and transitions, detections, rewards, training lifecycle and hash-linked events are stored in PostgreSQL. Separate Alembic streams manage control and target databases. Run events and episode timelines replay committed records. |
 | Range learning | A dedicated CPU worker holds separate Red and Blue policies fixed within each episode, then updates both with masked categorical PPO at the episode boundary. Teaching runs may be short; research runs require 10,000 completed episodes per training seed. |
 | Evaluation | Frozen candidate and baseline episodes run on paired seeds. Reports include verified attack/prevention, legitimate-read availability, and paired uncertainty. A supported-improvement claim also requires five independent training seeds and the availability criterion. |
-| Dashboard | `/sqli` launches the live SQLi walkthrough; `/sqli/{id}` replays the stored episode and plots measured outcomes separately from PPO metrics. `/range` preserves Violet Ledger training and replay. Graph simulator pages remain separately labeled. |
+| Dashboard | `/` is the live Red/Blue PPO training monitor; `/challenge` runs the latest completed joint checkpoint against one disposable phrase held in target memory. Legacy pages redirect to `/`. |
 
 Each executor sends HTTP requests to exactly one fixed target: the archived
 Ledger executor to Violet Ledger, and the SQLi executor to the SQLi service.
@@ -47,6 +47,16 @@ at [http://127.0.0.1:8000](http://127.0.0.1:8000), and both HTTP targets are
 reachable only from their fixed executors on internal networks. SQLi target
 health is reported by `GET /range/sqli/target/status`; Ledger health remains at
 `GET /range/health`.
+
+Opening `/` starts or reconnects to the single-seed 10,000-episode Red/Blue
+campaign when the private SQLi target is healthy. Each episode saves a joint
+model and optimizer checkpoint. After training, the frozen pair runs 500 new
+seeded matches. The page labels both phases as a classroom demonstration, not a
+multi-seed research claim. `/challenge` accepts one disposable phrase, stores it
+only in API and target process memory during the bounded session, and renders a
+redacted persisted event timeline. Red wins only on correlated target evidence
+of disclosure; Blue wins after 40 rounds when the legitimate lookup still works.
+Target or verifier failures are incomplete outcomes.
 
 The VIOLET database has its own volume for range run and event records; the
 simulator's existing metrics and checkpoints remain file-backed. Each target

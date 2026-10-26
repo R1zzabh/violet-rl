@@ -1,5 +1,5 @@
 import { redirect } from "next/navigation";
 
-export default function LegacyRangeTrainingPage(): never {
-  redirect("/range");
+export default function LegacyRoute() {
+  redirect("/");
 }

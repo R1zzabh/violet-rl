@@ -38,6 +38,11 @@ class LookupBody(BaseModel):
         return value
 
 
+class ChallengeSecretBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    phrase: str = Field(min_length=1, max_length=96)
+
+
 def create_app(
     database_url: str | None = None,
     evidence_path: Path | None = None,
@@ -57,7 +62,6 @@ def create_app(
     control_results = control_results or Path(
         os.getenv("SQLI_CONTROL_RESULTS", str(lab_state / "control/results"))
     )
-
     @asynccontextmanager
     async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
         task = asyncio.create_task(watch_controls(runtime, control_inbox, control_results))
@@ -89,6 +93,10 @@ def create_app(
     @app.middleware("http")
     async def add_target_event(request: Request, call_next: Any) -> Response:
         started = time.monotonic()
+        if request.url.path.startswith("/internal/challenges/"):
+            response = cast("Response", await call_next(request))
+            response.headers["Cache-Control"] = "no-store"
+            return response
         try:
             response = cast("Response", await call_next(request))
         except Exception:
@@ -119,10 +127,29 @@ def create_app(
     async def lookup_description() -> dict[str, object]:
         return {"route_id": "lookup", "method": "POST", "target_version": TARGET_VERSION}
 
+    @app.get("/internal/challenges/{challenge_id}/phrase")
+    async def get_challenge_phrase(challenge_id: str) -> dict[str, str]:
+        """Executor-only volatile read used to redact the phrase before spool writes."""
+        phrase = runtime.get_challenge(challenge_id)
+        if phrase is None:
+            raise HTTPException(status_code=404, detail="challenge is not active")
+        return {"phrase": phrase}
+
+    @app.post("/internal/challenges/{challenge_id}")
+    async def set_challenge_phrase(challenge_id: str, body: ChallengeSecretBody) -> dict[str, str]:
+        runtime.set_challenge(challenge_id, body.phrase)
+        return {"challenge_id": challenge_id, "status": "ready"}
+
+    @app.delete("/internal/challenges/{challenge_id}")
+    async def clear_challenge_phrase(challenge_id: str) -> dict[str, str]:
+        runtime.clear_challenge(challenge_id)
+        return {"challenge_id": challenge_id, "status": "cleared"}
+
     @app.post("/api/lookup")
     async def lookup(body: LookupBody, request: Request) -> JSONResponse:
         actor_ref = request.headers.get("x-range-actor", "guest")
         episode_id = request.headers.get("x-range-episode-id", "unscoped")
+        challenge_id = request.headers.get("x-range-challenge-id")
         if actor_ref not in {"guest", "researcher"}:
             raise HTTPException(status_code=400, detail="unknown synthetic actor")
         status, reason = runtime.check_request(actor_ref, episode_id)
@@ -134,6 +161,8 @@ def create_app(
                 "row_count": 0,
                 "unauthorized_rows": 0,
                 "query_rejected": False,
+                "challenge_id": challenge_id,
+                "challenge_disclosed": False,
             }
             return JSONResponse(status_code=status, content={"detail": reason, "rows": []})
         try:
@@ -152,9 +181,17 @@ def create_app(
                 "row_count": 0,
                 "unauthorized_rows": 0,
                 "query_rejected": True,
+                "challenge_id": challenge_id,
+                "challenge_disclosed": False,
             }
             return JSONResponse(status_code=400, content={"detail": "query rejected", "rows": []})
         unauthorized = sum(row["owner_ref"] != actor_ref for row in rows)
+        challenge_phrase = (
+            runtime.get_challenge(challenge_id)
+            if challenge_id and actor_ref == "guest" and unauthorized > 0
+            else None
+        )
+        challenge_disclosed = challenge_phrase is not None
         request.state.sqli_audit = {
             "field": body.field,
             "query_length": len(body.query_value),
@@ -162,15 +199,21 @@ def create_app(
             "row_count": len(rows),
             "unauthorized_rows": unauthorized,
             "query_rejected": False,
+            "challenge_id": challenge_id,
+            "challenge_disclosed": challenge_disclosed,
         }
+        content: dict[str, object] = {
+            "rows": rows,
+            "row_count": len(rows),
+            "target_version": TARGET_VERSION,
+            "controls": runtime.snapshot(),
+        }
+        if challenge_phrase is not None:
+            # The fixed executor removes this value in memory before writing its result spool.
+            content["challenge_phrase"] = challenge_phrase
         return JSONResponse(
             status_code=200,
-            content={
-                "rows": rows,
-                "row_count": len(rows),
-                "target_version": TARGET_VERSION,
-                "controls": runtime.snapshot(),
-            },
+            content=content,
         )
 
     return app
