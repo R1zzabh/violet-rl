@@ -1,5 +1,11 @@
 # Real-range PPO experiment results
 
+> Historical result artifact for the earlier real-range schema and reward
+> version. These measurements predate the current v2 observation, reward,
+> transition, joint-training, and research-run contracts in this worktree. No
+> v2 training or evaluation campaign has been run, so the values below do not
+> establish current-code performance.
+
 ## Hypothesis
 
 If the held-out synthetic task rewards useful policy behavior, the learned

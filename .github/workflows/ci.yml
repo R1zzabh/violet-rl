@@ -87,3 +87,52 @@ jobs:
         run: docker build -f docker/backend/Dockerfile -t violet-backend:ci .
       - name: Build frontend image
         run: docker build -f docker/frontend/Dockerfile -t violet-frontend:ci .
+
+  range-compose:
+    runs-on: ubuntu-latest
+    env:
+      COMPOSE_PROJECT_NAME: violet-ci
+      VIOLET_DB_PASSWORD: ci-control-owner
+      TARGET_DB_PASSWORD: ci-target-owner
+      VIOLET_RUNTIME_DB_PASSWORD: ci-control-runtime
+      TARGET_RUNTIME_DB_PASSWORD: ci-target-runtime
+      SQLI_DB_PASSWORD: ci-sqli-owner
+      SQLI_RUNTIME_DB_PASSWORD: ci-sqli-runtime
+      VIOLET_TRAINER_TOKEN: ci-worker-token
+      VIOLET_REQUIRE_TRAINER: "1"
+      VIOLET_API_PORT: "18080"
+      VIOLET_FRONTEND_PORT: "13000"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install smoke client
+        run: python -m pip install httpx
+
+      - name: Start isolated real ranges
+        run: docker compose up --build --detach backend range-executor violet-ledger range-trainer sqli-executor
+
+      - name: Verify real target requests and evidence replay
+        working-directory: ./backend
+        env:
+          VIOLET_API_URL: http://127.0.0.1:18080
+        run: python scripts/range_smoke.py
+
+      - name: Verify SQLi target behavior, evidence, and guided replay
+        working-directory: ./backend
+        env:
+          VIOLET_API_URL: http://127.0.0.1:18080
+          VIOLET_TRAINER_TOKEN: ci-worker-token
+        run: python scripts/sqli_range_smoke.py
+
+      - name: Verify Docker network boundaries and port bindings
+        working-directory: ./backend
+        run: python scripts/range_isolation_smoke.py
+
+      - name: Stop isolated real range
+        if: always()
+        run: docker compose down --volumes --remove-orphans

@@ -12,16 +12,39 @@ FIXTURE_OWNERS = {"doc_alice": "alice", "doc_bob": "bob"}
 
 
 def verify_document_access(
-    job: ExecutorJob, result: ExecutorResult, fixture_seed: int = 0
+    job: ExecutorJob,
+    result: ExecutorResult,
+    fixture_seed: int = 0,
+    target_evidence: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     action = job.action
     if not isinstance(action, CheckDocumentAccessAction):
         return {"status": "inconclusive", "reason": "not_a_document_access_action", "evidence": []}
+    if result.status == "outcome_unknown":
+        return {
+            "status": "inconclusive",
+            "reason": "executor_outcome_unknown",
+            "evidence": [str(result.request_id)],
+        }
     if result.status != "completed" or result.http_status != 200:
         return {
             "status": "failed",
             "reason": "request_did_not_return_document",
             "evidence": [str(result.request_id)],
+        }
+    correlation_matches = bool(
+        target_evidence
+        and target_evidence.get("target_event_id") == str(result.target_event_id)
+        and target_evidence.get("request_id") == str(job.request_id)
+        and target_evidence.get("run_id") == str(job.run_id)
+        and target_evidence.get("episode_id") == str(job.episode_id)
+        and target_evidence.get("action_id") == str(job.action_id)
+    )
+    if not correlation_matches:
+        return {
+            "status": "inconclusive",
+            "reason": "persisted_target_evidence_missing_or_mismatched",
+            "evidence": [str(job.request_id)],
         }
     try:
         import json

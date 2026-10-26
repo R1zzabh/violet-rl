@@ -81,12 +81,14 @@ class RLAgent(Agent):
     def select_action(self, env: Any, info: dict[str, Any]) -> int:
         """Return a masked action index from the loaded policy.
 
-        Falls back to random action selection until a policy is loaded (useful
-        for smoke tests, and a deliberate degradation — never a silent crash).
+        A requested RL policy without a loaded checkpoint is a configuration
+        error. Callers that want randomness must select a named random agent.
         """
         if self._policy is None:
-            action_space = env.action_space(self.agent_name)
-            return int(env.rng.randint(0, action_space.n - 1)) if env.rng is not None else 0
+            raise RuntimeError(
+                f"RL policy {self.agent_name!r} has no loaded checkpoint; "
+                "select an explicit random baseline or provide a compatible checkpoint"
+            )
         import numpy as np
 
         obs = np.asarray(env.observations[self.agent_name], dtype=np.float32)

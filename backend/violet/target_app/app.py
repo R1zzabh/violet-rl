@@ -105,11 +105,14 @@ def create_app(
                 else "unknown"
             )
         )
+        resource_ref = request.url.path.rsplit("/", 1)[-1] if route_id == "document" else route_id
         event_id = telemetry.record(
             {
                 **correlation,
                 "route_id": route_id,
+                "resource_ref": resource_ref,
                 "method": request.method,
+                "target_version": "violet_ledger_v1",
                 "status_class": response.status_code // 100,
                 "http_status": response.status_code,
                 "principal_ref": principal,

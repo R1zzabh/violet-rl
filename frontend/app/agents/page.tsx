@@ -14,12 +14,12 @@ function AgentColumn({ title, agents, accent, note }: { title: string; agents: A
       <p className="mono text-[10px] text-muted-foreground mb-3">{note}</p>
       <div className="space-y-2">
         {agents.map((a) => (
-          <div key={a.id} className="border border-[#222] p-3">
+          <div key={a.id} className="rounded-lg border border-[rgba(212,175,55,.12)] bg-[rgba(19,13,9,.62)] p-3">
             <div className="flex items-center justify-between gap-2 mb-1">
               <span className="mono text-sm font-bold text-white">{a.label}</span>
               <span
                 className="badge-brutal mono"
-                style={{ color: a.rl ? "#f5c518" : "#2ecc71", borderColor: a.rl ? "#f5c518" : "#2ecc71" }}
+                style={{ color: a.rl ? "#d4af37" : "#8fc49a", borderColor: a.rl ? "#d4af37" : "#8fc49a" }}
               >
                 {a.rl ? "UNAVAILABLE" : "AVAILABLE"}
               </span>
@@ -27,7 +27,7 @@ function AgentColumn({ title, agents, accent, note }: { title: string; agents: A
             <div className="mono text-[10px] text-muted-foreground">id: {a.id}</div>
             <div className="text-xs text-muted-foreground mt-1">{a.description}</div>
             {a.rl && (
-              <div className="mono text-[10px] text-yellow-400 mt-1">
+              <div className="mono text-[10px] text-[#e3c879] mt-1">
                 Requires a trained checkpoint (backend/runs/&lt;run&gt;/checkpoints/best). Not trained in this phase.
               </div>
             )}
@@ -66,7 +66,7 @@ export default function AgentsPage() {
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div>
           <div className="flex items-center gap-2 mb-1">
-            <Bot size={14} className="text-violet-400" />
+            <Bot size={14} className="text-[#d4af37]" />
             <span className="text-xs mono uppercase tracking-[0.2em] text-muted-foreground font-bold">
               Agent Registry
             </span>
@@ -86,12 +86,12 @@ export default function AgentsPage() {
       )}
 
       <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-        <AgentColumn title="🔴 RED — ATTACKERS" agents={red} accent="#ff2a2a" note="Implemented in backend/violet/agents/red.py" />
-        <AgentColumn title="🔵 BLUE — DEFENDERS" agents={blue} accent="#2a7aff" note="Implemented in backend/violet/agents/blue.py" />
+        <AgentColumn title="🔴 RED — ATTACKERS" agents={red} accent="#f07832" note="Implemented in backend/violet/agents/red.py" />
+        <AgentColumn title="🔵 BLUE — DEFENDERS" agents={blue} accent="#91bce2" note="Implemented in backend/violet/agents/blue.py" />
       </div>
 
       <p className="mono text-[11px] text-muted-foreground">
-        Source: <span className="text-violet-400">GET /agents</span> — registry mirrors the agent classes that exist in the
+        Source: <span className="text-[#d4af37]">GET /agents</span> — registry mirrors the agent classes that exist in the
         backend. Nothing here is speculative.
       </p>
     </div>

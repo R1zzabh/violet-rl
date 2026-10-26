@@ -1,4 +1,9 @@
-"""Small, reproducible PPO trainer that communicates only through the range API."""
+"""Legacy pre-v2 direct range runner retained for historical report analysis.
+
+Live real-range training is owned by ``trainer_main`` and the durable joint-run
+API. This direct runner speaks to retired endpoints and must not be used for
+new training or evaluation claims.
+"""
 
 from __future__ import annotations
 
@@ -239,7 +244,7 @@ class RangeTrainingRunner:
                 operation="CHECK_DOCUMENT_ACCESS",
                 document_ref="doc_alice" if action_id == 5 else "doc_bob",
                 # This exercise's objective is an authenticated Alice-to-Bob IDOR.
-                session_handle=sessions.get("alice"),
+                session_alias=sessions.get("alice"),
             )
         return CheckTargetHealthAction(operation="CHECK_TARGET_HEALTH")
 
@@ -351,9 +356,9 @@ class RangeTrainingRunner:
                 legitimate_request_attempts += 1
                 legitimate_request_successes += int(last_status == 200 and accepted)
                 false_blocked_legitimate_requests += int(last_status in {403, 423, 429})
-            session_handle = result.get("session_handle")
-            if principal in {"alice", "bob"} and session_handle:
-                sessions[str(principal)] = str(session_handle)
+            session_alias = result.get("session_alias")
+            if principal in {"alice", "bob"} and session_alias:
+                sessions[str(principal)] = str(session_alias)
             finding = result_payload.get("finding") or {}
             newly_confirmed_attack = not confirmed_attack and finding.get("status") == "confirmed"
             confirmed_attack = confirmed_attack or newly_confirmed_attack
@@ -462,14 +467,14 @@ class RangeTrainingRunner:
                     episode_id,
                     51 + step * 4,
                 )
-                alice_handle = alice["result"].get("session_handle")
-                bob_handle = bob["result"].get("session_handle")
-                if alice_handle and bob_handle:
+                alice_alias = alice["result"].get("session_alias")
+                bob_alias = bob["result"].get("session_alias")
+                if alice_alias and bob_alias:
                     unauthorized = self._job(
                         CheckDocumentAccessAction(
                             operation="CHECK_DOCUMENT_ACCESS",
                             document_ref="doc_bob",
-                            session_handle=alice_handle,
+                            session_alias=alice_alias,
                         ),
                         run_id,
                         episode_id,
@@ -479,7 +484,7 @@ class RangeTrainingRunner:
                         CheckDocumentAccessAction(
                             operation="CHECK_DOCUMENT_ACCESS",
                             document_ref="doc_bob",
-                            session_handle=bob_handle,
+                            session_alias=bob_alias,
                         ),
                         run_id,
                         episode_id,
@@ -703,39 +708,10 @@ class RangeTrainingRunner:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--api", default="http://127.0.0.1:8000")
-    parser.add_argument("--episodes", type=int, default=3)
-    parser.add_argument("--red-steps", type=int, default=6)
-    parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--run-dir", default="runs/real_range_ppo")
-    parser.add_argument(
-        "--evaluate", action="store_true", help="run deterministic inference without PPO updates"
+    parser.parse_args()
+    parser.error(
+        "the pre-v2 direct trainer is retired; launch a joint teaching or research run from /range"
     )
-    parser.add_argument(
-        "--resume", action="store_true", help="continue training from both role checkpoints"
-    )
-    parser.add_argument("--red-checkpoint")
-    parser.add_argument("--blue-checkpoint")
-    args = parser.parse_args()
-    if args.episodes < 1 or not 1 <= args.red_steps <= 20:
-        parser.error("episodes must be positive and red-steps must be between 1 and 20")
-    if args.evaluate and not (args.red_checkpoint and args.blue_checkpoint):
-        parser.error("--evaluate requires both --red-checkpoint and --blue-checkpoint")
-    if args.resume and not (args.red_checkpoint and args.blue_checkpoint):
-        parser.error("--resume requires both --red-checkpoint and --blue-checkpoint")
-    if args.evaluate and args.resume:
-        parser.error("--evaluate and --resume are mutually exclusive")
-    RangeTrainingRunner(
-        args.api,
-        args.run_dir,
-        seed=args.seed,
-        episodes=args.episodes,
-        red_steps=args.red_steps,
-        training=not args.evaluate,
-        red_checkpoint=args.red_checkpoint,
-        blue_checkpoint=args.blue_checkpoint,
-    ).run()
-    return 0
 
 
 if __name__ == "__main__":

@@ -7,9 +7,8 @@
 # data lives in code (violet.scenarios) and runs/ artifacts are mounted at
 # runtime. Nothing is copied from a configs path.
 #
-# Note on the pip installs below: the package itself is copied first and
-# installed non-editable; `.[dev]` provides the test tooling so the image can
-# also run the pytest suite (`docker run violet-backend pytest tests -q`).
+# The API image contains runtime dependencies only. Training dependencies live
+# in the isolated CPU worker image.
 
 FROM python:3.12-slim AS base
 
@@ -25,21 +24,15 @@ WORKDIR /app
 # Copy the package source before installing so hatchling can build it.
 COPY backend/pyproject.toml backend/README.md ./
 COPY backend/violet ./violet
-COPY backend/.wheelhouse /tmp/torch-wheelhouse
+COPY backend/migrations ./migrations
+COPY backend/scripts/provision_runtime_role.py ./scripts/provision_runtime_role.py
+COPY backend/scripts/provision_sqli_runtime_role.py ./scripts/provision_sqli_runtime_role.py
+COPY backend/alembic-control.ini ./alembic-control.ini
+COPY backend/alembic-sqli.ini ./alembic-sqli.ini
 
 RUN pip install --upgrade pip \
-    && if ls /tmp/torch-wheelhouse/*.whl >/dev/null 2>&1; then \
-         pip install /tmp/torch-wheelhouse/*.whl; \
-       else \
-         pip install --index-url https://download.pytorch.org/whl/cpu --extra-index-url https://pypi.org/simple "torch>=2.1"; \
-       fi \
-    && pip install ".[api,dev,rl]" \
-    && rm -rf /tmp/torch-wheelhouse \
+    && pip install ".[api]" \
     && rm -rf /root/.cache/pip
-
-# ---- app (tests + scripts only; package already installed above) ----
-COPY backend/tests ./tests
-COPY backend/scripts ./scripts
 
 # Non-root user
 RUN addgroup --system --gid 10001 violet \

@@ -52,6 +52,7 @@ def submit_job(
         "/range/jobs",
         json={
             "action": action,
+            "purpose": "evaluator",
             "run_id": run_id,
             "episode_id": episode_id,
             "step_id": step_id,
@@ -107,15 +108,15 @@ def main() -> None:
             0,
         )
         alice_result = login_alice["result"]
-        assert alice_result["http_status"] == 200 and alice_result["session_handle"]
-        alice_session = alice_result["session_handle"]
+        assert alice_result["http_status"] == 200 and alice_result["session_alias"]
+        alice_session = alice_result["session_alias"]
 
         vulnerable = submit_job(
             client,
             {
                 "operation": "CHECK_DOCUMENT_ACCESS",
                 "document_ref": "doc_bob",
-                "session_handle": alice_session,
+                "session_alias": alice_session,
             },
             run_id,
             episode_id,
@@ -130,6 +131,7 @@ def main() -> None:
             "/range/controls",
             json={
                 "action": "HARDEN_DOCUMENT_OWNERSHIP",
+                "purpose": "evaluator",
                 "run_id": run_id,
                 "episode_id": episode_id,
             },
@@ -144,7 +146,7 @@ def main() -> None:
             {
                 "operation": "CHECK_DOCUMENT_ACCESS",
                 "document_ref": "doc_bob",
-                "session_handle": alice_session,
+                "session_alias": alice_session,
             },
             run_id,
             episode_id,
@@ -153,25 +155,39 @@ def main() -> None:
         assert denied["result"]["http_status"] == 403
         assert denied["finding"]["status"] != "confirmed"
 
+        alice_owner = submit_job(
+            client,
+            {
+                "operation": "CHECK_DOCUMENT_ACCESS",
+                "document_ref": "doc_alice",
+                "session_alias": alice_session,
+            },
+            run_id,
+            episode_id,
+            3,
+        )
+        assert alice_owner["result"]["http_status"] == 200
+        assert alice_owner["finding"]["status"] != "confirmed"
+
         login_bob = submit_job(
             client,
             {"operation": "AUTH_TEST", "credential_ref": "synthetic_bob"},
             run_id,
             episode_id,
-            3,
+            4,
         )
         assert login_bob["result"]["http_status"] == 200
-        bob_session = login_bob["result"]["session_handle"]
+        bob_session = login_bob["result"]["session_alias"]
         owner_access = submit_job(
             client,
             {
                 "operation": "CHECK_DOCUMENT_ACCESS",
                 "document_ref": "doc_bob",
-                "session_handle": bob_session,
+                "session_alias": bob_session,
             },
             run_id,
             episode_id,
-            4,
+            5,
         )
         assert owner_access["result"]["http_status"] == 200
         assert owner_access["finding"]["status"] != "confirmed"
@@ -179,12 +195,17 @@ def main() -> None:
 
         verification_payload = {
             "unauthorized_job_id": denied["job"]["job_id"],
+            "alice_owner_job_id": alice_owner["job"]["job_id"],
             "owner_job_id": owner_access["job"]["job_id"],
         }
         verification = client.post(
             f"/range/controls/{control.json()['command_id']}/verify",
             json=verification_payload,
         )
+        if verification.is_error:
+            raise RuntimeError(
+                f"control verification failed: {verification.status_code} {verification.text}"
+            )
         verification.raise_for_status()
         assert verification.json()["status"] == "verified"
         assert all(verification.json()["checks"].values())

@@ -8,11 +8,19 @@ from violet.range.contracts import (
     ExecutorJob,
     ExecutorResult,
 )
-from violet.range.control_verifier import verify_ownership_control
+from violet.range.control_verifier import submission_event_type, verify_ownership_control
+
+
+def test_submission_event_type_tracks_policy_and_evaluator_jobs() -> None:
+    assert submission_event_type("policy") == "action_submitted"
+    assert submission_event_type("evaluator") == "evaluator_probe_submitted"
 
 
 def _job(
-    run_id, episode_id, principal: Literal["alice", "bob"]
+    run_id,
+    episode_id,
+    principal: Literal["alice", "bob"],
+    document_ref: Literal["doc_alice", "doc_bob"] = "doc_bob",
 ) -> tuple[ExecutorJob, ExecutorResult]:
     job_id, action_id, request_id = uuid4(), uuid4(), uuid4()
     target_event_id = uuid4()
@@ -25,10 +33,11 @@ def _job(
         action_id=action_id,
         request_id=request_id,
         idempotency_key=action_id,
+        purpose="evaluator",
         action=CheckDocumentAccessAction(
             operation="CHECK_DOCUMENT_ACCESS",
-            document_ref="doc_bob",
-            session_handle="A" * 43,
+            document_ref=document_ref,
+            session_alias="session-0123456789ab",
         ),
     )
     result = ExecutorResult(
@@ -36,7 +45,7 @@ def _job(
         action_id=action_id,
         request_id=request_id,
         status="completed",
-        http_status=403 if principal == "alice" else 200,
+        http_status=403 if principal == "alice" and document_ref == "doc_bob" else 200,
         target_event_id=target_event_id,
         principal_ref=principal,
         started_at="2026-10-10T00:00:00+00:00",
@@ -66,10 +75,18 @@ def test_control_verification_requires_denial_and_owner_availability() -> None:
         completed_at="2026-10-10T00:00:00+00:00",
     )
     alice_job, alice_result = _job(run_id, episode_id, "alice")
+    alice_owner_job, alice_owner_result = _job(run_id, episode_id, "alice", "doc_alice")
     bob_job, bob_result = _job(run_id, episode_id, "bob")
 
     verified = verify_ownership_control(
-        command, acknowledgement, alice_job, alice_result, bob_job, bob_result
+        command,
+        acknowledgement,
+        alice_job,
+        alice_result,
+        alice_owner_job,
+        alice_owner_result,
+        bob_job,
+        bob_result,
     )
 
     assert verified["status"] == "verified"
@@ -78,7 +95,14 @@ def test_control_verification_requires_denial_and_owner_availability() -> None:
 
     mismatched_ack = acknowledgement.model_copy(update={"episode_id": uuid4()})
     rejected = verify_ownership_control(
-        command, mismatched_ack, alice_job, alice_result, bob_job, bob_result
+        command,
+        mismatched_ack,
+        alice_job,
+        alice_result,
+        alice_owner_job,
+        alice_owner_result,
+        bob_job,
+        bob_result,
     )
     assert rejected["status"] == "failed"
     assert rejected["checks"]["control_acknowledged"] is False
@@ -104,11 +128,19 @@ def test_control_verification_rejects_service_disruption() -> None:
         completed_at="2026-10-10T00:00:00+00:00",
     )
     alice_job, alice_result = _job(run_id, episode_id, "alice")
+    alice_owner_job, alice_owner_result = _job(run_id, episode_id, "alice", "doc_alice")
     bob_job, bob_result = _job(run_id, episode_id, "bob")
     bob_result = bob_result.model_copy(update={"http_status": 503})
 
     verified = verify_ownership_control(
-        command, acknowledgement, alice_job, alice_result, bob_job, bob_result
+        command,
+        acknowledgement,
+        alice_job,
+        alice_result,
+        alice_owner_job,
+        alice_owner_result,
+        bob_job,
+        bob_result,
     )
 
     assert verified["status"] == "failed"

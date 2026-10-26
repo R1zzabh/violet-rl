@@ -1,4 +1,10 @@
-# violet/training.py — training loop skeleton
+"""Graph-simulator rollout recording helpers (not real-range RL training).
+
+These routines execute the PettingZoo graph simulator with supplied policies and
+write episode metrics. They do not update policy parameters. Use ``violet train``
+for the separate simulator PPO trainer; Violet Ledger range training is a distinct
+workflow and must not consume these graph observations or rewards.
+"""
 
 from __future__ import annotations
 
@@ -69,10 +75,9 @@ def train_red(
     base_dir: str = "runs",
     on_episode: Callable[[EpisodeMetrics], None] | None = None,
 ) -> list[EpisodeMetrics]:
-    """Train RED against a fixed BLUE for one phase.
+    """Record graph-simulator episodes for supplied Red/Blue policies.
 
-    Skeleton: extends to full RLlib integration later. For now it runs the
-    environment with the given agents and records metrics.
+    This function performs no optimizer updates and is not a real-range trainer.
     """
     run_dir = _make_run_dir(base_dir, config.run_id)
     metrics: list[EpisodeMetrics] = []
@@ -177,9 +182,10 @@ def train_blue(
     base_dir: str = "runs",
     on_episode: Callable[[EpisodeMetrics], None] | None = None,
 ) -> list[EpisodeMetrics]:
-    """Train BLUE against a fixed RED for phase 1.
+    """Record graph-simulator episodes with the supplied agent order.
 
-    Same skeleton as train_red but conceptually the defender is learning.
+    This compatibility helper performs no Blue PPO optimization and is not a
+    real-range training entry point.
     """
     return train_red(env, blue_agent, red_agent, config, base_dir, on_episode)
 

@@ -1,4 +1,4 @@
-# VIOLET's control plane and Violet Ledger training range.
+# VIOLET control plane, SQLi classroom lab, and archived Violet Ledger range.
 # All host ports are loopback-only. The executor, target, and target database
 # sit on internal Docker networks with no path to external systems.
 
@@ -10,15 +10,25 @@ services:
       - sh
       - -c
       - >-
-        mkdir -p /spool/jobs /spool/processing /spool/results /spool/records /control-inbox /control-results /evidence;
+        mkdir -p /spool/jobs /spool/processing /spool/results /spool/records /control-inbox /control-results /evidence /sqli-training-runs;
         chown -R 10001:10001 /spool && chmod 2770 /spool /spool/jobs /spool/processing /spool/results /spool/records;
         chown -R 10001:10001 /control-inbox && chmod 2750 /control-inbox;
-        chown -R 10002:10001 /control-results /evidence && chmod 2750 /control-results /evidence
+        chown -R 10002:10001 /control-results /evidence && chmod 2750 /control-results /evidence;
+        mkdir -p /sqli-spool/jobs /sqli-spool/processing /sqli-spool/results /sqli-control-inbox /sqli-control-results /sqli-evidence;
+        chown -R 10005:10001 /sqli-spool && chmod 2770 /sqli-spool /sqli-spool/jobs /sqli-spool/processing /sqli-spool/results;
+        chown -R 10001:10001 /sqli-control-inbox && chmod 2770 /sqli-control-inbox;
+        chown -R 10004:10001 /sqli-control-results /sqli-evidence && chmod 2770 /sqli-control-results /sqli-evidence;
+        chown -R 10003:10003 /sqli-training-runs && chmod 2770 /sqli-training-runs
     volumes:
       - executor-spool:/spool
       - target-control-inbox:/control-inbox
       - target-control-results:/control-results
       - target-evidence:/evidence
+      - sqli-executor-spool:/sqli-spool
+      - sqli-control-inbox:/sqli-control-inbox
+      - sqli-control-results:/sqli-control-results
+      - sqli-target-evidence:/sqli-evidence
+      - sqli-training-runs:/sqli-training-runs
     restart: "no"
 
   db:
@@ -36,12 +46,29 @@ services:
       retries: 10
     networks: [control]
 
+  range-migrate:
+    image: violet-control:local
+    build:
+      context: .
+      dockerfile: docker/backend/Dockerfile
+    command: ["sh", "-c", "python scripts/provision_runtime_role.py && alembic -c alembic-control.ini upgrade head"]
+    environment:
+      DATABASE_URL: postgresql+psycopg2://violet:${VIOLET_DB_PASSWORD:?Set VIOLET_DB_PASSWORD in .env}@db:5432/violet
+      RUNTIME_DB_USER: violet_api
+      RUNTIME_DB_PASSWORD: ${VIOLET_RUNTIME_DB_PASSWORD:?Set VIOLET_RUNTIME_DB_PASSWORD in .env}
+    depends_on:
+      db:
+        condition: service_healthy
+    networks: [control]
+    restart: "no"
+
   backend:
+    image: violet-control:local
     build:
       context: .
       dockerfile: docker/backend/Dockerfile
     environment:
-      DATABASE_URL: postgresql+psycopg2://violet:${VIOLET_DB_PASSWORD:?Set VIOLET_DB_PASSWORD in .env}@db:5432/violet
+      DATABASE_URL: postgresql+psycopg2://violet_api:${VIOLET_RUNTIME_DB_PASSWORD:?Set VIOLET_RUNTIME_DB_PASSWORD in .env}@db:5432/violet
       ENVIRONMENT: production
       LOG_LEVEL: info
       FRONTEND_URL: http://localhost:3000
@@ -49,6 +76,11 @@ services:
       VIOLET_CONTROL_INBOX: /var/lib/violet/target-control/inbox
       VIOLET_CONTROL_RESULTS: /var/lib/violet/target-control/results
       VIOLET_TARGET_EVIDENCE: /var/lib/violet/target-evidence
+      VIOLET_TRAINER_TOKEN: ${VIOLET_TRAINER_TOKEN:?Set VIOLET_TRAINER_TOKEN in .env}
+      SQLI_EXECUTOR_SPOOL: /var/lib/violet/sqli-executor-spool
+      SQLI_CONTROL_INBOX: /var/lib/violet/sqli-control/inbox
+      SQLI_CONTROL_RESULTS: /var/lib/violet/sqli-control/results
+      SQLI_TARGET_EVIDENCE: /var/lib/violet/sqli-evidence/events.jsonl
     ports:
       - "127.0.0.1:${VIOLET_API_PORT:-8000}:8000"
     depends_on:
@@ -56,13 +88,19 @@ services:
         condition: service_completed_successfully
       db:
         condition: service_healthy
+      range-migrate:
+        condition: service_completed_successfully
     volumes:
       - ./backend/runs:/app/runs
       - executor-spool:/var/lib/violet/executor-spool
       - target-control-inbox:/var/lib/violet/target-control/inbox
       - target-control-results:/var/lib/violet/target-control/results:ro
       - target-evidence:/var/lib/violet/target-evidence:ro
-    networks: [control, api-host]
+      - sqli-executor-spool:/var/lib/violet/sqli-executor-spool
+      - sqli-control-inbox:/var/lib/violet/sqli-control/inbox
+      - sqli-control-results:/var/lib/violet/sqli-control/results:ro
+      - sqli-target-evidence:/var/lib/violet/sqli-evidence:ro
+    networks: [control, api-host, trainer-control]
     restart: unless-stopped
 
   frontend:
@@ -77,7 +115,32 @@ services:
     depends_on:
       backend:
         condition: service_started
-    networks: [control, api-host]
+    restart: unless-stopped
+
+  range-trainer:
+    build:
+      context: .
+      dockerfile: docker/trainer/Dockerfile
+    environment:
+      VIOLET_API_URL: http://backend:8000
+      VIOLET_TRAINER_TOKEN: ${VIOLET_TRAINER_TOKEN:?Set VIOLET_TRAINER_TOKEN in .env}
+      VIOLET_WORKER_ID: range-trainer-1
+      VIOLET_RUNS_DIR: /app/runs
+      SQLI_ARTIFACT_ROOT: /var/lib/violet/sqli-runs
+    depends_on:
+      backend:
+        condition: service_started
+    volumes:
+      - ./backend/runs:/app/runs
+      - sqli-training-runs:/var/lib/violet/sqli-runs
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,noexec,nosuid,nodev
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    networks: [trainer-control]
+    mem_limit: 2g
+    pids_limit: 128
     restart: unless-stopped
 
   target-db:
@@ -98,12 +161,27 @@ services:
     pids_limit: 128
     restart: unless-stopped
 
+  target-migrate:
+    build:
+      context: .
+      dockerfile: docker/target/Dockerfile
+    command: ["sh", "-c", "python scripts/provision_runtime_role.py && alembic -c alembic-target.ini upgrade head"]
+    environment:
+      TARGET_DATABASE_URL: postgresql+psycopg2://violet_target:${TARGET_DB_PASSWORD:?Set TARGET_DB_PASSWORD in .env}@target-db:5432/violet_target
+      RUNTIME_DB_USER: ledger_runtime
+      RUNTIME_DB_PASSWORD: ${TARGET_RUNTIME_DB_PASSWORD:?Set TARGET_RUNTIME_DB_PASSWORD in .env}
+    depends_on:
+      target-db:
+        condition: service_healthy
+    networks: [target-data]
+    restart: "no"
+
   violet-ledger:
     build:
       context: .
       dockerfile: docker/target/Dockerfile
     environment:
-      TARGET_DATABASE_URL: postgresql+psycopg2://violet_target:${TARGET_DB_PASSWORD:?Set TARGET_DB_PASSWORD in .env}@target-db:5432/violet_target
+      TARGET_DATABASE_URL: postgresql+psycopg2://ledger_runtime:${TARGET_RUNTIME_DB_PASSWORD:?Set TARGET_RUNTIME_DB_PASSWORD in .env}@target-db:5432/violet_target
       TARGET_EVIDENCE_PATH: /var/lib/violet/evidence/target-access.jsonl
       TARGET_CONTROL_INBOX: /control/inbox
       TARGET_CONTROL_RESULTS: /control/results
@@ -112,6 +190,8 @@ services:
         condition: service_completed_successfully
       target-db:
         condition: service_healthy
+      target-migrate:
+        condition: service_completed_successfully
     volumes:
       - target-control-inbox:/control/inbox:ro
       - target-control-results:/control/results
@@ -159,6 +239,107 @@ services:
     pids_limit: 64
     restart: unless-stopped
 
+  sqli-db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: sqli_owner
+      POSTGRES_PASSWORD: ${SQLI_DB_PASSWORD:?Set SQLI_DB_PASSWORD in .env}
+      POSTGRES_DB: sqli_lab
+    volumes:
+      - sqli-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U sqli_owner -d sqli_lab"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    networks: [sqli-data]
+    mem_limit: 384m
+    pids_limit: 96
+    restart: unless-stopped
+
+  sqli-migrate:
+    image: violet-control:local
+    build:
+      context: .
+      dockerfile: docker/backend/Dockerfile
+    command: ["sh", "-c", "alembic -c alembic-sqli.ini upgrade head && python scripts/provision_sqli_runtime_role.py"]
+    environment:
+      SQLI_OWNER_DATABASE_URL: postgresql+psycopg2://sqli_owner:${SQLI_DB_PASSWORD:?Set SQLI_DB_PASSWORD in .env}@sqli-db:5432/sqli_lab
+      SQLI_DATABASE_URL: postgresql+psycopg2://sqli_owner:${SQLI_DB_PASSWORD:?Set SQLI_DB_PASSWORD in .env}@sqli-db:5432/sqli_lab
+      SQLI_RUNTIME_DB_USER: sqli_runtime
+      SQLI_RUNTIME_DB_PASSWORD: ${SQLI_RUNTIME_DB_PASSWORD:?Set SQLI_RUNTIME_DB_PASSWORD in .env}
+    depends_on:
+      sqli-db:
+        condition: service_healthy
+    networks: [sqli-data]
+    restart: "no"
+
+  sqli-target:
+    build:
+      context: .
+      dockerfile: docker/sqli-target/Dockerfile
+    environment:
+      SQLI_DATABASE_URL: postgresql+psycopg2://sqli_runtime:${SQLI_RUNTIME_DB_PASSWORD:?Set SQLI_RUNTIME_DB_PASSWORD in .env}@sqli-db:5432/sqli_lab
+      SQLI_TARGET_EVIDENCE: /var/lib/violet/sqli-evidence/events.jsonl
+      SQLI_CONTROL_INBOX: /control/inbox
+      SQLI_CONTROL_RESULTS: /control/results
+    depends_on:
+      range-volume-init:
+        condition: service_completed_successfully
+      sqli-db:
+        condition: service_healthy
+      sqli-migrate:
+        condition: service_completed_successfully
+    volumes:
+      - sqli-control-inbox:/control/inbox:ro
+      - sqli-control-results:/control/results
+      - sqli-target-evidence:/var/lib/violet/sqli-evidence
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,noexec,nosuid,nodev
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    networks: [sqli-range, sqli-data]
+    mem_limit: 384m
+    pids_limit: 96
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8002/health', timeout=2)"
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  sqli-executor:
+    image: violet-control:local
+    build:
+      context: .
+      dockerfile: docker/backend/Dockerfile
+    command: ["python", "-m", "violet.sqli_lab.executor_main"]
+    environment:
+      SQLI_EXECUTOR_SPOOL: /spool
+      SQLI_TARGET_BASE_URL: http://sqli-target:8002
+    depends_on:
+      range-volume-init:
+        condition: service_completed_successfully
+      sqli-target:
+        condition: service_healthy
+    volumes:
+      - sqli-executor-spool:/spool
+    user: "10005:10001"
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,noexec,nosuid,nodev
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    networks: [sqli-range]
+    mem_limit: 192m
+    pids_limit: 48
+    restart: unless-stopped
+
 volumes:
   pgdata:
   target-pgdata:
@@ -166,6 +347,12 @@ volumes:
   target-control-inbox:
   target-control-results:
   target-evidence:
+  sqli-pgdata:
+  sqli-executor-spool:
+  sqli-control-inbox:
+  sqli-control-results:
+  sqli-target-evidence:
+  sqli-training-runs:
 
 networks:
   control:
@@ -174,7 +361,13 @@ networks:
     driver: bridge
     driver_opts:
       com.docker.network.bridge.enable_ip_masquerade: "false"
+  trainer-control:
+    internal: true
   range:
     internal: true
   target-data:
+    internal: true
+  sqli-range:
+    internal: true
+  sqli-data:
     internal: true

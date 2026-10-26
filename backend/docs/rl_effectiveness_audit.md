@@ -1,111 +1,106 @@
-# Real-range RL effectiveness audit
+# VIOLET learning and evidence audit
 
-## Scope and evidence
+## Baseline and scope
 
-This audit follows one training decision cycle from the role observation to
-the typed HTTP executor, target response, verifier, reward, rollout, and saved
-update. The evaluation fixture is the disposable Alice/Bob Violet Ledger
-database; no external target is involved. Source references below use paths
-relative to `backend/`.
+The merged baseline identified for this work was `f9077c9`. The repository
+already contained a substantial dirty and untracked worktree when this
+implementation continued. Those changes were preserved and remain local
+worktree changes; they are not evidence of merged or deployed behavior.
 
-## Findings
+The core real-range task is one synthetic Violet Ledger target and one
+Alice-to-Bob unauthorized document-access objective. The graph simulator is a
+separate environment. It changes in-memory graph state and cannot support
+claims about HTTP execution, Violet Ledger, or real-range PPO.
 
-The prior 20-episode held-out run produced 0/20 verified Red successes and
-20/20 verified Blue preventions in every matchup. This is not evidence that
-PPO learned: the same outcomes arise from the scripted policy, and all Blue
-prevention-eligible episodes are won by one early control decision.
+The historical [`rl_experiment_results.md`](rl_experiment_results.md) records
+an earlier experiment with no demonstrated improvement. Its schemas, reward
+values, and trainer path predate the v2 implementation and must not be
+presented as results from the current worktree.
 
-The root cause is the exercise design and action mask, rather than a verified
-PPO optimizer defect:
+## Locked contract in this worktree
 
-1. `violet/range/train_real.py::RangeTrainingRunner.run_episode` alternates one
-   Red request and one Blue decision. Red's scripted first action authenticates
-   Alice. Blue can then apply ownership hardening before the next Red request.
-2. The Blue mask is `[no_op, harden, disabled, disabled]` for the whole run.
-   Rate limiting and account blocking are catalogued but not executable. The
-   runner restricts Blue to the only action with a valid independent verifier.
-3. After hardening, the control verifier checks Alice's foreign read is HTTP
-   403 and Bob's own read is HTTP 200. The control is credited as prevention
-   when Red has not yet produced a confirmed foreign-read finding. The verifier
-   establishes the control's security effect, but cannot establish that an
-   attack would otherwise have succeeded.
-4. Blue receives +1 for that verified control and no cost for applying it
-   before a threat. In this fixture, ownership hardening does not impair Bob's
-   legitimate access. Consequently hardening immediately after Alice's auth is
-   a dominant scripted response. A Red foreign read verified before that
-   decision is irreversible and Blue receives no prevention credit.
-5. The target fixture seed changes only the deterministic canary, not the
-   ownership relation or policy consequences (`violet/target_app/database.py`).
-   Therefore different held-out seeds are not different task scenarios.
+| Contract | Version or rule |
+|---|---|
+| Red observation | `red.range_observation.v2` |
+| Blue observation | `blue.range_observation.v2` |
+| Feature encoder | `violet.range.features.v2` |
+| Action catalogs | `red.action_catalog.v2`, `blue.action_catalog.v2` |
+| Reward | `violet.range.reward.v2` |
+| Core task | Alice's session requests Bob's synthetic document |
+| Red reward | `+1` only for an independently verified foreign canary read |
+| Blue reward | `+1` only after foreign denial plus legitimate Alice and Bob reads |
+| False alert cost | `-1` per evidence-attributed false alert |
+| Legitimate denial cost | `-1` per denied legitimate access |
+| Policy update boundary | Independent Red and Blue PPO updates after one completed joint episode |
+| Research training minimum | 10,000 completed episodes per training seed |
+| Research evaluation minimum | 100 completed paired held-out episodes |
+| Improvement gate | Positive paired net-security interval, availability criterion met, and at least five independent training seeds |
 
-### Representative scripted episode trace
+The reward weights are equal in magnitude for one verified prevention and one
+false alert or legitimate denial. They are stored as separate components. The
+API enforces the episode and paired-evaluation minimums for research jobs.
+Teaching runs can be short and are clearly distinguished in the persisted
+configuration.
 
-For `--red-steps 6`, the representative scripted trajectory is:
+## Evidence boundaries
 
-| Turn | Role and observation | Action / executor outcome | Evidence and reward | Rollout |
-|---|---|---|---|---|
-| 0 | Red: Alice unauthenticated, zero objectives | `login_synthetic_alice`; typed auth succeeds, HTTP 200 | Alice setup +0.05; next observation records Alice auth | Accepted Red transition; enters PPO rollout |
-| 0 | Blue: one request observed, no verified attack/prevention/control | `harden_document_ownership`; typed control applied | verifier's Alice foreign `403` and Bob owner `200`; +1 prevention | Accepted Blue transition; enters PPO rollout |
-| 1–5 | Red: Alice authenticated, no verified objective | foreign-document read; HTTP 403 after hardening | each failure −0.1; no Red finding | Each accepted request enters Red rollout |
-| 1–5 | Blue: ownership control already applied | no-op | zero verified outcome/reward | Each accepted no-op enters Blue rollout |
-| End | Both roles: six decisions, time limit reached | `terminated=false`, final `truncated=true` | GAE bootstraps final value and stops the trace | Each role updates from its six accepted transitions |
+- Red and Blue receive role-specific canonical observations. Blue's sanitizer
+  removes verifier labels, canaries, ownership fields, session aliases, and
+  secret fields recursively, including names containing those terms.
+- A Red positive reward requires a persisted executor result, target event,
+  request correlation, and seed-derived canary match. HTTP 200 by itself is not
+  a finding.
+- A Blue positive reward requires target acknowledgement and an independent
+  three-probe control check. The verifier checks Alice's foreign denial plus
+  Alice's and Bob's legitimate reads.
+- Only accepted, actually executed policy decisions enter a PPO update.
+  Rejected decisions remain auditable and break the GAE trace. Unknown
+  outcomes mark the episode incomplete and are excluded from completed
+  training episodes.
+- Manual workbench requests and evaluator probes have distinct origins and do
+  not enter policy rollouts.
+- Evaluation runs do not call an optimizer. Candidate and baseline share
+  held-out fixture seeds. Reports expose verified outcomes and availability;
+  policy changes, losses, entropy, gradients, and training return alone do not
+  support an improvement claim.
 
-For this trajectory, Red return is `0.05 - 5*0.1 = -0.45`; Blue return is
-`+1`. HTTP success on Alice's auth is setup evidence only. Red success requires
-the independent canary verifier; Blue prevention requires the post-control
-ownership verifier. Requests produced by the control verifier are evidence
-jobs, not policy transitions.
+## Implementation status and limits
 
-## Component review
+The current worktree contains the v2 observations, reward rules, independent
+control verification, per-decision categorical samples, transition
+projections, joint episode training, research episode gates, read-only episode
+timelines, separate Alembic revisions, restricted runtime roles, and a rebuilt
+Violet Ledger console. They remain uncommitted worktree changes, not merged or
+deployed behavior.
 
-- `violet/range/learning.py` keeps independent actor, critic, optimizer, and
-  random streams by role. The action mask is applied during sampling and PPO
-  log-probability recomputation. Rollouts contain accepted actions only.
-- GAE in `violet/algorithms/ppo.py` bootstraps time-limit truncations from each
-  transition's `next_value`, while terminal transitions do not bootstrap.
-- The PPO update checks finite loss, gradients, and clipped gradient norm;
-  tests snapshot each role's parameters and assert a valid update changes them.
-  These checks verify optimization executes, not that outcomes improve.
-- Red has eight catalogued actions and receives a small Alice-auth setup reward,
-  a verified foreign-read reward, and a failed-request cost. Blue's actual
-  mask currently reduces four catalogued actions to two. The reward and mask
-  make the measured Blue policy a binary timing choice, not a defense-selection
-  policy.
-- `violet/range/verifier.py` independently validates document identity,
-  owner, and fixture canary. `violet/range/control_verifier.py` validates
-  post-control Alice denial and Bob availability. Neither verifier is weakened
-  by this audit.
-- The runner persists observations, masks, proposal/acceptance, reward
-  components, next observations, ending flags, selected action probability,
-  entropy, and policy version. Update events record loss, advantage summaries,
-  gradient norm, and clip fraction.
-- Evaluation is deterministic for learned policies and makes no optimizer
-  updates. Evaluation seeds are explicitly held out from the short training
-  seed range, but the fixture's security properties do not vary with seed.
+Verification completed in this continuation: all 126 backend tests passed;
+Ruff lint and format checks, mypy, frontend typecheck/lint, and the production
+frontend build passed. Fresh SQLite migration chains and both PostgreSQL
+migration services succeeded. The Compose TCP smoke confirmed the seeded
+canary finding, ownership hardening, Alice/Bob owner access, and 25 sequenced
+hash-linked events. Isolation probes confirmed the executor's single target
+reachability, loopback-only API binding, prohibited egress/DB/API denials, and
+that API and target runtime roles cannot create schema objects. The local
+Compose check did not start the trainer image; the CI job now includes it, but
+that workflow has not yet run.
 
-## Experiment-design conclusion
+The following research work is still outstanding:
 
-The existing exercise is adequate for verifying that typed requests, target
-controls, independent evidence, rollout construction, PPO updates, and
-checkpoints work end to end. It is not adequate for demonstrating policy
-improvement: it has one meaningful defensive control, no operational cost or
-legitimate-service tradeoff for that control, a deterministic threat sequence,
-and a verifier that proves control effect rather than counterfactual
-prevention. Different policy pairings can therefore share identical terminal
-outcomes even when their action distributions differ.
+- The worker trains one seed per run. Five independent checkpoints are not yet
+  aggregated into a campaign manifest, so even a 100-pair evaluation of one
+  checkpoint cannot pass the five-seed improvement gate.
+- Held-out evaluation reports a paired net-security score and eligibility
+  checks but no current v2 evaluation artifact exists.
+- Rate limiting and actor blocking remain unavailable to Blue policies until
+  their effects and legitimate-user availability costs have independent
+  verifiers.
+- Runtime roles still have broader table-level CRUD privileges than needed,
+  and the event chain does not yet have database-enforced append-only
+  permissions.
+- Compose restart and worker-failure recovery, browser E2E, trainer-container
+  reachability, and the full 10,000-episode research campaign remain
+  unverified in this worktree. CI is configured to build and probe the trainer
+  container, but that job has not run yet.
 
-A passive Blue calibration using the already-valid no-op action was added to
-the evaluator as an extra cell beyond the five requested pairings. This is not
-a modified target scenario: it checks that the existing default fixture and
-independent finding verifier distinguish an unopposed scripted Red attack
-from a Blue policy that hardens after Alice authenticates. See the calibration
-row in `rl_experiment_results.md` and raw episode data in
-`runs/real_range_eval/audit_comparison_with_calibration.json`.
-
-No arbitrary reward was added and no verifier contract was weakened. The
-measured experiment should remain a verification exercise, and learning
-effectiveness must be reported as not demonstrated. To support a later
-effectiveness claim, design explicit synthetic scenarios with verified
-tradeoffs (including legitimate availability and false-block evidence),
-broaden the controls only alongside independent verifiers, then validate
-scripted and random baselines before training.
+Until those checks and a preregistered held-out campaign pass, state the result
+as **no supported improvement**.

@@ -1,72 +1,94 @@
 import type { Metadata } from "next";
 import { DM_Sans, Space_Mono } from "next/font/google";
 import Link from "next/link";
+import {
+  Activity,
+  Bug,
+  BookOpenCheck,
+  ChartNoAxesCombined,
+  LayoutDashboard,
+  Network,
+  Shield,
+  Swords,
+  UsersRound,
+} from "lucide-react";
 import "./globals.css";
 
 const dmSans = DM_Sans({
-  subsets: [],
+  subsets: ["latin"],
   weight: ["400", "500", "600", "700"],
   variable: "--font-dm-sans",
   display: "swap",
 });
 
 const spaceMono = Space_Mono({
-  subsets: [],
+  subsets: ["latin"],
   weight: ["400", "700"],
   variable: "--font-space-mono",
   display: "swap",
 });
 
 export const metadata: Metadata = {
-  title: "VIOLET — Multi-Agent RL Cyber Attack & Defense Simulator",
+  title: "VIOLET · Violet Ledger Cyber Range",
   description:
-    "A simulated cyber network modeled as a Partially Observable Markov Game, where autonomous attacker and defender agents learn sequential strategies through competitive multi-agent reinforcement learning.",
+    "Evidence-backed Red and Blue policy research for the isolated Violet Ledger training target.",
 };
 
-export default function RootLayout({
-  children,
-}: {
-  children: React.ReactNode;
-}) {
+const simulationLinks = [
+  { href: "/simulation", label: "Graph simulation", icon: Activity },
+  { href: "/training", label: "Graph training", icon: Swords },
+  { href: "/evaluation", label: "Graph evaluation", icon: ChartNoAxesCombined },
+  { href: "/network", label: "Topology", icon: Network },
+  { href: "/agents", label: "Agent registry", icon: UsersRound },
+  { href: "/behavior", label: "Behavior analysis", icon: BookOpenCheck },
+];
+
+export default function RootLayout({ children }: { children: React.ReactNode }) {
   return (
-    <html lang="en" className="antialiased">
-      <head>
-        <link rel="preconnect" href="https://fonts.googleapis.com" />
-        <link
-          rel="preconnect"
-          href="https://fonts.gstatic.com"
-          crossOrigin="anonymous"
-        />
-      </head>
-      <body className="bg-[#0a0a0a] text-[#f5f5f5] min-h-screen flex flex-col">
-        <nav className="brutal-container max-w-[1280px] mx-auto w-full px-6 py-3 flex flex-wrap items-center justify-between gap-y-2 shrink-0">
-          <div className="flex items-center gap-3">
-            <span className="text-2xl font-bold tracking-tight" style={{ fontFamily: dmSans.variable }}>
-              VIOLET
-            </span>
-            <span className="badge-brutal badge-violet mono hidden sm:inline">MARL · Cyber</span>
+    <html lang="en" className={`${dmSans.variable} ${spaceMono.variable}`}>
+      <body>
+        <div className="app-frame">
+          <aside className="app-sidebar" aria-label="Main navigation">
+            <Link className="brand-lockup" href="/" aria-label="VIOLET command center">
+              <span className="brand-mark" aria-hidden="true">V</span>
+              <span>
+                <span className="brand-name">VIOLET</span>
+                <span className="brand-subtitle" style={{ display: "block" }}>Research console</span>
+              </span>
+            </Link>
+            <span className="nav-kicker">Workspace</span>
+            <nav className="app-nav">
+              <Link href="/"><LayoutDashboard size={15} aria-hidden="true" />Command center</Link>
+              <Link className="nav-primary" href="/sqli"><Bug size={15} aria-hidden="true" />SQLi learning lab</Link>
+              <Link href="/range"><Shield size={15} aria-hidden="true" />Violet Ledger archive</Link>
+            </nav>
+            <span className="nav-kicker">Simulation research</span>
+            <nav className="app-nav" aria-label="Simulation research">
+              {simulationLinks.map(({ href, label, icon: Icon }) => (
+                <Link href={href} key={href}><Icon size={15} aria-hidden="true" />{label}</Link>
+              ))}
+              <Link href="/experiments"><ChartNoAxesCombined size={15} aria-hidden="true" />Experiments</Link>
+            </nav>
+            <div className="sidebar-status" aria-label="Range target boundary">
+              <div className="sidebar-status-title">Target boundary</div>
+              <div className="sidebar-status-value"><span className="status-lamp" />Isolated HTTP lab</div>
+              <div className="sidebar-status-note">Synthetic records · no public target<br />Executor and database networks separated</div>
+            </div>
+          </aside>
+          <div className="app-workspace">
+            <header className="app-topbar">
+              <span className="topbar-context">Cyber range / live target research</span>
+              <div className="topbar-right">
+                <span>SQLI LAB · V1</span>
+                <span className="environment-pill"><span className="status-lamp" />private range</span>
+              </div>
+            </header>
+            <main className="app-content">{children}</main>
+            <footer className="app-footer">
+              VIOLET · Real HTTP evidence and graph simulation are stored and evaluated separately.
+            </footer>
           </div>
-          <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-sm mono" style={{ fontFamily: spaceMono.variable }}>
-            <span className="badge-brutal badge-green">Phase 1</span>
-            <span className="text-muted-foreground hidden md:inline">|</span>
-            <Link href="/" className="ml-2 hover:text-violet-400 transition-colors">Overview</Link>
-            <Link href="/simulation" className="ml-2 hover:text-violet-400 transition-colors">Simulation</Link>
-            <Link href="/training" className="ml-2 hover:text-violet-400 transition-colors">Training</Link>
-            <Link href="/range-training" className="ml-2 hover:text-violet-400 transition-colors">Real Range</Link>
-            <Link href="/behavior" className="ml-2 hover:text-violet-400 transition-colors">Behavior</Link>
-            <Link href="/evaluation" className="ml-2 hover:text-violet-400 transition-colors">Evaluation</Link>
-            <Link href="/experiments" className="ml-2 hover:text-violet-400 transition-colors">Experiments</Link>
-            <Link href="/agents" className="ml-2 hover:text-violet-400 transition-colors">Agents</Link>
-            <Link href="/network" className="ml-2 hover:text-violet-400 transition-colors">Network</Link>
-          </div>
-        </nav>
-        <main className="max-w-[1280px] mx-auto px-6 py-6 w-full flex-1">{children}</main>
-        <footer className="border-t-2 border-[#222] mt-10 pb-6 pt-4 text-center mono text-xs text-muted-foreground w-full shrink-0" style={{ fontFamily: spaceMono.variable }}>
-          <span className="badge-brutal badge-violet mr-2">v0.1.0</span>
-          VIOLET · Multi-Agent RL Cyber Attack &amp; Defense Simulator
-          <br />
-          <span className="text-muted-foreground opacity-60">All activity is simulated. No real exploitation. No real targets.</span>
-        </footer>
+        </div>
       </body>
     </html>
   );

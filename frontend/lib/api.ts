@@ -68,9 +68,9 @@ export type RunSummary = {
 
 export type TrainingMetric = {
   update: number;
-  global_step: number;
-  mean_episode_reward: number;
-  attack_success_rate: number;
+  global_step?: number | null;
+  mean_episode_reward?: number | null;
+  attack_success_rate?: number | null;
   loss?: number;
   policy_loss?: number;
   value_loss?: number;

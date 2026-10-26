@@ -1,128 +1,100 @@
 # VIOLET backend
 
-The backend contains the graph simulator, its simulator-only PPO trainer, the
-FastAPI service, and the separate Violet Ledger HTTP range. Range actions are
-typed contracts; the executor maps them to fixed operations against the local
-`violet-ledger` service.
+The backend contains a graph simulator and two distinct real HTTP exercises:
+the SQLi learning lab and the preserved Violet Ledger IDOR range. Simulator
+runs do not produce evidence about target traffic or real-range learning.
 
-## Install
+## Install and run
 
 ```bash
 pip install -e ".[api,dev]"
+pip install -e ".[rl]"  # required by the CPU range trainer
 ```
 
-Install the optional `rl` extra to run simulator PPO (`pip install -e ".[rl]"`).
-The real-range slice includes a separate CPU PPO trainer for Red and Blue. Ray
-is not required by the custom simulator or real-range PPO implementations.
-
-## Run the local real range
-
-Start Docker Compose from the repository root after configuring `.env` from
-`.env.example`. The target is reachable only on Compose's internal range
-network. The executor cannot access either PostgreSQL service; Violet Ledger
-can access only its separate synthetic target database.
+Configure `.env` at the repository root from `.env.example` with separate owner
+and restricted runtime passwords for the control, Ledger, and SQLi databases,
+plus a separate `VIOLET_TRAINER_TOKEN`, then start Compose:
 
 ```bash
 docker compose up --build
 ```
 
-Check `GET http://127.0.0.1:8000/range/health`, then run the complete bounded
-IDOR/control acceptance path:
+Each target is reachable only on its private range network. Executors have no
+database or API network; the trainer reaches only the API through
+`trainer-control`; migration services attach only to their respective database
+networks. The SQLi runtime role can only read its fixture table. API and
+frontend ports bind to loopback.
+
+## Real-range workflow
+
+Open `/sqli` for the SQLi lab's target status, PPO training, evaluation, and
+persisted instructor replay. Open `/range` for the preserved Ledger's typed
+manual workbench, Blue SOC, and historical training/evaluation views. SQLi
+training uses separate Red and Blue PPO actors, critics, optimizers, random
+streams, and policy versions. The pair stays fixed within each episode;
+accepted transitions are stored before either role updates at the boundary.
+Unknown or rejected outcomes never enter PPO data. Red selects bounded action
+components that the executor composes into a request parameter; Blue acts on
+sanitized HTTP telemetry and the target applies its typed control. The no-defense
+comparator is evaluation-only.
+
+The Ledger training flow updates separate Red and Blue policies after the same
+completed episode. Teaching runs can be short; research training
+requires 10,000 completed episodes per seed. `/range/{training_run_id}` replays
+the persisted event stream. The API validates the exact observation, full
+policy sample, and decision before a policy action. Manual requests use the
+same bounded executor and remain outside PPO rollouts. Blue receives sanitized
+telemetry without verifier labels or session aliases.
+
+The Ledger verifier confirms the synthetic IDOR only after correlated target
+evidence matches the seeded canary. A control is “applied” on target
+acknowledgement and “verified” only after follow-up foreign-denial and owner
+access probes. Rewards link to verifier/detector/control evidence. The event
+stream replays committed sequence numbers and resumes from `Last-Event-ID`.
+
+The Ledger CPU worker runs independent masked categorical PPO policies and saves both
+optimizer states with a schema-checked joint checkpoint. Evaluation loads a
+frozen pair without optimizer updates and compares it with a scripted or random
+pair on paired seeds. Reports include verified task outcomes, legitimate-read
+availability, and uncertainty. One training seed cannot pass the five-seed
+research gate and is never labeled an improvement.
 
 ```bash
 python scripts/range_smoke.py
+python scripts/sqli_range_smoke.py
+python scripts/range_isolation_smoke.py
 ```
 
-The range API exposes `POST /range/jobs`, `GET /range/jobs/{job_id}`,
-`POST /range/reset`, `POST /range/controls`, `GET /range/controls/{id}`, and
-`POST /range/controls/{id}/verify` for ownership-control verification, plus
-`GET /range/runs/{run_id}/events?after_seq=N` for sequence-based replay.
-Job actions contain operation IDs and catalog references; they do not contain
-URLs or arbitrary paths. The executor enforces a 40-request episode budget, a
-five-minute episode deadline, one in-flight request, a five-second request
-timeout, and a ten-request-per-second ceiling.
+The Ledger smoke verifies the seeded IDOR, hardening effect, owner availability,
+correlated evidence, hash-linked replay, and cursor resume. The SQLi smoke
+checks real target requests before/after parameterization, synthetic evidence,
+legitimate-query availability, and event replay. The isolation smoke checks
+both Compose network boundaries, published ports, SQLi read-only permissions,
+and approved/prohibited destinations.
 
-## Storage boundary
+## Persistence
 
-The two PostgreSQL services have separate named volumes. Violet Ledger's
-database contains only Alice/Bob test fixtures and target control state. The
-VIOLET PostgreSQL database stores range runs, episodes, typed job/control
-outboxes, target evidence, and a sequence-numbered, hash-linked event timeline.
-The API commits each job/control before placing it in the volume queue and
-reconciles pending records after restart. Result and acknowledgement records
-are added to the canonical timeline before replay returns them. The control
-verifier requires post-acknowledgement Alice `403` and Bob `200` transactions
-with target evidence before it records a verified outcome. Target access
-evidence and control acknowledgements are mounted read-only into the API.
+`range-migrate` and `target-migrate` own separate Alembic streams with explicit
+table revisions. `sqli-migrate` provisions the SQLi fixture schema and its
+read-only runtime role. API/target PostgreSQL startup validates migrated schemas.
+SQLite test databases self-initialize. Migration services use owner credentials;
+API and target processes use separate restricted runtime roles. Ledger grants
+retain existing behavior; SQLi uses a read-only `SELECT` grant. Append-only SQL
+permissions for the event store remain hardening work.
 
-The current SQLAlchemy schema is bootstrapped with `create_all()` at API
-startup; Alembic migrations and immutable database permissions are still
-outstanding. Simulator runs remain file-backed. Real-range observations,
-actions, outcomes, rewards, and actual optimizer updates are recorded in the
-hash-linked event timeline.
+The canonical range event chain is stored in VIOLET PostgreSQL. Target
+middleware produces structured JSONL evidence; artifact exports verify event
+hashes and redact secrets. Graph simulator run artifacts, metrics, and
+checkpoints remain beneath `backend/runs/<run_id>/`. The Compose trainer writes
+SQLi PPO checkpoints and metrics to its trainer-owned `sqli-training-runs`
+volume so the restricted worker can save and reload them without changing
+ownership of existing local research artifacts.
 
-Export a persisted real-range run from the API container:
+## Simulator-only training
 
-```bash
-docker compose exec backend python scripts/export_range_run.py <run-id>
-```
+`violet train` and the current graph PPO implementation operate only on the
+PettingZoo graph simulator. They do not send Violet Ledger HTTP requests and
+their reward/evaluation artifacts must remain labeled simulator-only.
 
-The bundle is written beneath `backend/runs/<run-id>/`. Export verifies the
-event hash chain and redacts session handles, cookies, tokens, and credential
-values before writing JSONL plus a SHA-256 manifest.
-
-## Verify
-
-```bash
-pytest tests/unit/test_range_contracts.py -q
-pytest tests/unit/test_control_verifier.py -q
-pytest tests/integration/test_real_target.py -q
-pytest tests/integration/test_persistence_replay.py -q
-```
-
-The simulator suite does not prove real-range learning. The persistence test
-checks event ordering/hash links and repository restart; the Compose smoke test
-also verifies HTTP evidence and sequence replay through the API. The read-only
-frontend event timeline is available at `/range-training` and never executes
-historical actions.
-
-## Initial real-range PPO runner
-
-Rebuild the backend image once to install the declared CPU-only RL extra:
-
-```bash
-docker compose build backend
-```
-
-With the Compose stack running, run the trainer in the backend's Python 3.12
-container (the API service is addressed as `backend` on the Compose network):
-
-```bash
-docker compose run --rm backend python -m violet.range.train_real --api http://backend:8000 --episodes 3 --red-steps 6 --seed 42 --run-dir runs/real_range_ppo
-```
-
-The runner has separate Red and Blue actor/critic networks and checkpoints.
-Per-step transitions are persisted by `POST /range/training/transitions` in the
-existing event chain. Blue is limited to no-op and ownership hardening because
-only ownership hardening has an independent verifier proving Alice's denial
-and Bob's continued service. Use `--resume --red-checkpoint ...
---blue-checkpoint ...` to continue or `--evaluate` with both checkpoints for
-deterministic inference. Compare the five scripted, random, and learned pairings
-plus a passive-Blue calibration cell on common held-out fixture seeds with:
-
-```bash
-docker compose build backend
-docker compose run --rm backend python -m violet.range.evaluate_real --api http://backend:8000 --episodes 20 --seed 10000 \
-  --red-checkpoint runs/real_range_ppo_final/red.pt \
-  --blue-checkpoint runs/real_range_ppo_final/blue.pt \
-  --training-seeds 42,43,44 \
-  --output runs/real_range_eval/audit_comparison_with_calibration.json
-```
-
-The report contains raw episode records, per-role action frequencies, selected
-action probability, policy entropy, and independent-verifier labels. The
-passive-Blue cell checks the known unopposed attack. Random actions are sampled
-uniformly from the valid action mask using the evaluation
-seed. This synthetic HTTP experiment is not evidence of production-network
-effectiveness. See `docs/rl_effectiveness_audit.md` and
-`docs/rl_experiment_results.md` for the task limitations and measured results.
+See [`docs/REAL_RANGE_ARCHITECTURE.md`](docs/REAL_RANGE_ARCHITECTURE.md) for
+event semantics, network boundaries, endpoint details, and current limitations.

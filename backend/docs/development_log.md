@@ -5,6 +5,78 @@ Statuses: `NOT STARTED` / `IN DEVELOPMENT` / `IMPLEMENTED` / `TESTED` / `VERIFIE
 
 ---
 
+## 2026-10-13 — Real-range persistence, PPO jobs, replay, and boundaries
+
+**Status: IMPLEMENTED; local UI, database, range, and network checks passed. Full trainer-image isolation and statistical-learning gates remain open.**
+
+### Implemented
+- Added independent Alembic control/target streams, startup schema checks, and
+  database-scoped Compose migration services.
+- Added durable training-run/update records and authenticated worker claim,
+  heartbeat, update, stop, and completion endpoints. Queued stop requests
+  terminate without claiming; expired worker leases are failed as
+  `episode_state_unknown` rather than retried.
+- Added a dedicated CPU worker using masked categorical PPO for Red or Blue
+  typed catalogs. It runs through the API episode coordinator, writes
+  checkpoints/metrics/config under `backend/runs/`, checks checkpoint digests
+  and schemas, and resumes compatible optimizer state.
+- Added paired candidate/baseline range evaluation with per-episode records and
+  a paired bootstrap interval. A single checkpoint has one training seed, so
+  it cannot satisfy the five-seed improvement gate; reports keep the claim at
+  “no supported improvement.”
+- Added a committed-event SSE endpoint with replay cursor and a `/range` launch,
+  run-list, stop, live replay, and evidence inspector UI. Updated simulator
+  pages to identify graph-only state and removed illustrative learning numbers.
+- Split trainer API networking from the database network; trainer has no DB,
+  executor, or target attachment. Added an isolation smoke covering network
+  membership, ports, API/target reachability, database access, public egress,
+  metadata, and host gateway probes.
+- Bound policy decisions to API-rebuilt observations; required persisted
+  decisions for policy jobs/controls; labeled verification-only probes
+  separately; reserved four requests in policy observation masks; added
+  allowlisted method/route/header metadata to executor results.
+
+### Verification
+- Frontend `npm run typecheck`: passed.
+- Frontend `npm run lint`: passed.
+- Python bytecode compilation: passed.
+- Ruff check and formatter over backend source/tests/migrations: passed.
+- Focused range unit tests: 21 passed.
+- Docker Compose configuration validation: passed.
+- Full backend suite: `PYTHONPATH=/tmp/violet-test-deps .venv/bin/pytest tests -q`
+  → 106 passed. The temporary dependency path supplies SQLAlchemy without
+  modifying the project virtual environment.
+- Fresh isolated Compose databases completed both migration services. The
+  range smoke confirmed the seeded IDOR, then verified Alice received 403 and
+  Bob received 200 after ownership hardening; the replay contained 22 events.
+- One Red PPO training episode completed against Violet Ledger and saved a
+  three-transition checkpoint (SHA-256
+  `70eeaa20a7fb9b7c2debcece280e216fd29cf66b2d4711edf688d7a717441f44`). One
+  Blue PPO training episode also completed and saved its checkpoint (SHA-256
+  `fe06145479e948c6f042446ceeed27ee4ec59dff689db3b3c07a46444be807ff`).
+- Red checkpoint evaluation: 2 paired episodes, mean reward -0.03 versus 0.98
+  for scripted baseline; paired 95% bootstrap interval [-1.01, -1.01]. Blue:
+  2 pairs, 0.5 versus 0.5; interval [0, 0]. Both correctly report “no
+  supported improvement.” Each role has only one training seed and two pairs.
+- Executor isolation passed. A disposable container on `trainer-control`
+  reached only the API among tested destinations; both databases, target,
+  public egress, and metadata were unreachable. The configured trainer service
+  image itself was not built or started.
+- `docker compose config -q` needs the local password variables to be set; the
+  isolated Compose stack had already been started with local-only credentials.
+
+### Remaining release gates
+- Runtime PostgreSQL credentials still use database-owner accounts; add
+  restricted roles and append-only SQL permissions with a safe existing-volume
+  transition.
+- Build and run the actual trainer service image and execute the isolation
+  script against that container; the policy worker was run on the host against
+  the isolated API for the real-target training/evaluation exercises.
+- Run at least five independently seeded training jobs and 100 held-out pairs
+  per claimed matchup; no policy improvement result is claimed before then.
+- League-based co-evolution, additional verified scenarios, and durable
+  artifact registry/promotion are still future work.
+
 ## 2026-09-09 — Phase 1/4: Environment core + baseline battles
 
 **Feature:** Topology-aware `ScriptedAggressiveRedAgent` + end-to-end scripted battles.
@@ -356,93 +428,107 @@ is an acceptance slice, not a real-range learning result.
 with verified control outcomes before connecting either PPO policy to the real
 range.
 
----
+## 2026-10-13 — persisted role decisions and evidence-derived signals
 
-## 2026-10-25 — Real-range PPO implementation slice
+- Added versioned Red/Blue range observations and an auditable decision
+  contract. Decisions store the exact observation, action mask, policy ID,
+  selected typed action, and inference duration in both a projection table and
+  the run's hash-linked timeline.
+- Added the typed `RangeEpisodeRunner` for Red request → persisted target
+  evidence → Blue observation/detection/control ordering.
+- Added deterministic telemetry-only Blue detection and versioned decomposed
+  Red/Blue reward functions. Reward endpoints derive labels from persisted
+  verifier and control-verification events rather than client-supplied claims.
+- Added fixed Red and Blue action catalogs with precondition/budget masks, a
+  deterministic numeric encoder for response classes, actors, target health,
+  controls, budgets, and masks, plus a safe target status endpoint.
+- Added caller-stable job idempotency keys and control command IDs. A worker
+  restart now records an in-flight request as `outcome_unknown` instead of
+  requeueing a request that may already have affected the target.
+- IDOR verification now requires matching persisted target evidence and its
+  request, run, episode, and action correlation IDs. Control verification also
+  checks both follow-up target evidence records.
+- Replaced the persisted raw session handle with an opaque `session_alias` in
+  the action/result contracts. The executor keeps cookie jars in memory and
+  accepts only aliases on later document reads. Plain-text response excerpts
+  redact credential-shaped values.
+- Clarified that `training.py` is graph-simulator rollout recording, not a
+  real-range PPO trainer. Added [`REAL_RANGE_ARCHITECTURE.md`](REAL_RANGE_ARCHITECTURE.md)
+  with the event vocabulary and current limitations.
+- Verification run: 20 focused contract, observation, reward, and verifier tests passed;
+  Python compilation and `git diff --check` passed. Target/database integration
+  tests were not run in this environment because SQLAlchemy is missing from the
+  local virtual environment.
 
-**Status: IMPLEMENTED; HTTP PATH VERIFIED; PPO OPTIMIZATION UNVERIFIED**
+Remaining work includes Alembic-managed migrations, a CPU real-range PPO worker,
+Blue control verification through the runner, held-out multi-seed evaluation,
+trainer/emergency-stop lifecycle endpoints, full container isolation checks,
+and a persisted range replay UI. No real-range policy improvement is claimed.
 
-### Implemented
-- Added separate Red and Blue categorical PPO actor/critic models over
-  `violet.range.observation.v1`, with finite action catalogs, role checks,
-  stochastic training actions, deterministic inference, optimizer updates,
-  and role/schema/action-checked checkpoints.
-- Added `/range/training/transitions` and `/range/training/updates`; each
-  appends typed transition/update events into the existing run hash chain.
-- Added a real-range runner that sends all Red requests and Blue controls via
-  the existing HTTP API and typed executor. Blue is masked to no-op and
-  ownership hardening because that is the only control with the independent
-  Alice-denied/Bob-served verifier.
-- Corrected simulator GAE so terminal transitions stop value bootstrap while
-  time-limit truncations bootstrap the final value and stop the trace.
-- Added architecture, algorithm, reward, training, evaluation, and
-  troubleshooting documentation.
+## 2026-10-13 — real-range training, replay, and migration continuation
 
-### Verified
-- Backend suite in the Linux backend container: **87 passed, 1 skipped**. The
-  skipped module is the optional PPO-specific test, because the backend image
-  does not install the optional `rl` extra.
-- Ruff check on changed Python sources: **passed**; `compileall` and
-  `git diff --check`: **passed**.
-- Compose backend, executor, target, and databases started. The existing
-  `scripts/range_smoke.py` confirmed the seeded IDOR, then independently
-  verified Alice `403` and Bob `200` and persisted 22 ordered events.
-- Manually posted a bounded learning transition and PPO-update event to the
-  new API; replay showed `learning_transition` and
-  `learning_policy_update` in sequence.
+- Added role-specific PPO training and paired evaluation jobs behind durable API
+  records, a token-authenticated CPU worker, checkpoint schema/digest checks,
+  cooperative stop handling, and CLI/UI launch and status controls. Each job
+  performs one optimizer update; it is not a multi-seed policy league.
+- Added migration streams for the VIOLET and Violet Ledger databases, production
+  schema validation, separate database networks, and a trainer-only control
+  network. Removed development/test dependencies from the production API image.
+- Added the real-range launch and persisted event replay pages and corrected
+  simulator labels and unsupported homepage metrics.
+- Fixed control verification ordering to recognize persisted evaluator probe
+  events as well as policy submissions; added unit coverage for the mapping.
+- Local checks: all 89 backend unit tests passed, along with Ruff, Python
+  compilation, frontend typecheck/lint, Compose config, and `git diff --check`.
+- Full backend suite passed: 106 tests (SQLAlchemy supplied temporarily from
+  `/tmp/violet-test-deps`). Frontend typecheck/lint and Python compilation
+  passed. Ruff is not installed in this workspace, so lint/format checks with
+  Ruff were not rerun in this continuation.
+- Fresh Compose databases completed both migration services and started the
+  API, target, and executor. The Compose range smoke confirmed the seeded IDOR,
+  verified Alice received 403 while Bob received 200 after ownership hardening,
+  and checked 22 sequenced hash-linked events. The first run exposed the
+  evaluator event-type bug; after loading the fix into the isolated smoke
+  container, the complete smoke passed.
+- Executor isolation passed: it reached only Violet Ledger and could not reach
+  the API, either database, public probe, or metadata endpoint. A disposable
+  actor on the trainer-only network reached the API and could not reach either
+  database, the target, public egress, or metadata. The trainer image itself
+  was not built or started.
+- Red and Blue each completed a one-episode live PPO update, and their saved
+  checkpoints loaded for paired evaluation. Each evaluation used two pairs;
+  neither policy improved over its scripted baseline (Red mean paired delta
+  -1.01, Blue 0.0). These small samples are smoke evaluations, not learning
+  evidence.
+- Five independent seeds, 100 held-out pairs per matchup, opponent-league
+  co-evolution, full trainer-container probing, database-owner runtime
+  credentials, and SQL-level append-only permissions remain release gates.
 
-### Not verified / limitations
-- This host's Anaconda PyTorch fails to initialize with Windows error 1114
-  while loading `c10.dll`; the backend image intentionally lacks optional
-  PyTorch. Therefore the actual PPO optimizer tests, parameter-change check,
-  checkpoint load in execution, and a training run were not executed.
-- The dashboard does not expose the new training workflow. The full frontend
-  image was not built during the bounded integration check.
-- No learned-versus-baseline or held-out metrics are reported. Rate limiting
-  and actor blocking remain masked in the learning runner pending independent
-  outcome verification.
+## 2026-10-25 — contract consolidation and container acceptance
 
-See `docs/architecture-audit.md` and `docs/real-range-training.md` for current
-commands and constraints.
-
----
-
-## 2026-10-25 — PPO runtime verification and dashboard completion
-
-**Status: PPO UPDATES AND REAL HTTP TRAINING VERIFIED; POLICY IMPROVEMENT NOT DEMONSTRATED**
-
-### Runtime and tests
-- Rebuilt `docker/backend/Dockerfile` with the declared `rl` extra and an
-  official CPU-only PyTorch wheel. The isolated Linux runtime reports Python
-  **3.12.15**, PyTorch **2.14.1+cpu**, and `(tensor([1,2])**2).sum() == 5.0`.
-- A separate Windows venv with Python **3.12.4** and PyTorch **2.14.1+cpu**
-  still fails at `c10.dll` with WinError 1114. No Anaconda packages were
-  removed or replaced.
-- Final backend suite: **108 passed, 0 failed, 0 skipped**; Ruff: **passed**.
-  Frontend TypeScript, ESLint, and Docker production build passed. The
-  `/range-training` page returned HTTP 200 from both local production serving
-  and the Compose frontend.
-
-### Training, evaluation, and persisted evidence
-- Ran three episodes at seeds 42–44, six Red decisions and six Blue decisions
-  per episode. A separately instrumented rerun recorded 18 accepted transitions
-  per role, three policy updates per role, and four optimizer steps per update
-  (12 optimizer steps per role). The event store recorded 36 transitions, six
-  policy-update events, 30 executor results, three independent control
-  verifications, three completed episode events, and a completed run status.
-  Invalid action count was zero.
-- Both checkpoints were loaded in deterministic evaluation. All decisions were
-  repeatable and the evaluation records reported zero optimizer updates. Unit
-  tests snapshot both role parameter sets around updates and verify that each
-  changes, losses/gradients stay finite, checkpoints restore, and evaluation
-  does not mutate parameters.
-- The corrected reward gives no positive Red reward for irrelevant Bob
-  authentication. In the 20-episode-per-pair held-out comparison, all four
-  pairings had 0% verified Red success and 100% Blue prevention on eligible
-  episodes. The fixture outcomes were identical, so bootstrap intervals were
-  degenerate. This demonstrates the range path and verifier, not learned
-  improvement. Raw comparison is in
-  `backend/runs/real_range_eval/comparison_reward_v2.json`.
-- Dashboard reads `GET /range/runs` and `GET /range/runs/{id}/events`; viewing
-  history does not execute past actions. Blue remains limited to no-op and
-  ownership hardening because other controls lack independent verifiers.
+- Consolidated the real-range policy path around versioned Red/Blue observations,
+  bounded action catalogs, complete policy samples, accepted transitions, and
+  independent episode-boundary PPO updates. Manual requests and evaluator
+  probes keep distinct origins and are excluded from policy rollouts.
+- Tightened ownership-control verification to require Alice's denied foreign
+  read plus successful Alice and Bob owner reads. Added request/evidence checks,
+  research minimums, paired outcome metrics, and explicit no-improvement gates.
+- Added explicit Alembic control/target revisions, separate restricted runtime
+  roles, a Compose network-isolation probe, and the shared API/migration image.
+  The isolation check now verifies loopback port binding and rejects runtime
+  schema creation.
+- Added persisted episode listing/timeline and role-scoped PPO update routes,
+  and rebuilt the range console around the single real target while keeping the
+  graph simulator separately labeled.
+- Local verification: **126 backend tests passed**; Ruff lint/format, mypy,
+  frontend typecheck/lint/production build, and whitespace checks passed.
+  Fresh SQLite migration chains and both PostgreSQL Compose migrations passed.
+  The real-container smoke confirmed the IDOR canary, Alice's 403 after
+  hardening, Alice/Bob owner reads, and 25 sequential hash-linked events.
+  Network probes passed for executor/API/database/egress boundaries, API
+  loopback binding, and denied schema creation by both runtime roles.
+- CI now includes a Compose range acceptance job that also starts the trainer
+  container. That workflow has not yet run locally; neither has the full
+  10,000-episode, five-seed held-out campaign. No current v2 improvement claim
+  is supported. Runtime table grants remain broader than needed, and SQL-level
+  event-chain append-only enforcement remains future hardening.

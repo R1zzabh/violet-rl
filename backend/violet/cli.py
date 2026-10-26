@@ -105,6 +105,38 @@ def _cmd_replay(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_range(args: argparse.Namespace) -> int:
+    """Submit or inspect real-range jobs through the VIOLET API."""
+    import json
+    import os
+
+    import httpx
+
+    base_url = os.getenv("VIOLET_API_URL", "http://127.0.0.1:8000").rstrip("/")
+    with httpx.Client(base_url=base_url, timeout=10.0) as client:
+        if args.range_command in {"train", "evaluate"}:
+            payload = {
+                "role": args.role,
+                "mode": args.range_command,
+                "episodes": args.episodes,
+                "max_steps": args.max_steps,
+                "seed": args.seed,
+                "opponent": args.opponent,
+            }
+            if args.range_command == "evaluate":
+                if not args.checkpoint_run_id:
+                    raise SystemExit("range evaluate requires --checkpoint-run-id")
+                payload["checkpoint_run_id"] = args.checkpoint_run_id
+            response = client.post("/range/training-runs", json=payload)
+        elif args.range_command == "status":
+            response = client.get(f"/range/training-runs/{args.training_run_id}")
+        else:
+            response = client.post(f"/range/training-runs/{args.training_run_id}/stop")
+        response.raise_for_status()
+        print(json.dumps(response.json(), indent=2, sort_keys=True))
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="violet", description="VIOLET: Multi-Agent RL Cyber Attack & Defense Simulator"
@@ -128,6 +160,20 @@ def main(argv: list[str] | None = None) -> int:
     p_replay.add_argument("--steps", type=int, default=10)
     p_replay.add_argument("--seed", type=int, default=42)
 
+    p_range = sub.add_parser("range", help="manage real Violet Ledger range jobs")
+    range_commands = p_range.add_subparsers(dest="range_command", required=True)
+    for name in ("train", "evaluate"):
+        p_job = range_commands.add_parser(name)
+        p_job.add_argument("--role", choices=("red", "blue"), required=True)
+        p_job.add_argument("--episodes", type=int, default=1)
+        p_job.add_argument("--max-steps", type=int, default=12)
+        p_job.add_argument("--seed", type=int, default=17)
+        p_job.add_argument("--opponent", choices=("scripted", "random"), default="scripted")
+        p_job.add_argument("--checkpoint-run-id", type=str, default=None)
+    for name in ("status", "stop"):
+        p_job = range_commands.add_parser(name)
+        p_job.add_argument("training_run_id")
+
     args = parser.parse_args(argv)
 
     if args.command == "scenario":
@@ -138,6 +184,8 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_train(args)
     if args.command == "replay":
         return _cmd_replay(args)
+    if args.command == "range":
+        return _cmd_range(args)
 
     parser.print_help()
     return 0

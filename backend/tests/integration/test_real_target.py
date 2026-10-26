@@ -61,14 +61,14 @@ def test_real_http_idor_blue_control_and_target_evidence(tmp_path) -> None:
         )
         auth_result = await executor.execute(auth_job)
         assert auth_result.status == "completed" and auth_result.http_status == 200
-        assert auth_result.session_handle and auth_result.principal_ref == "alice"
+        assert auth_result.session_alias and auth_result.principal_ref == "alice"
         assert "Set-Cookie" not in auth_result.response_excerpt
 
         vulnerable_job = make_job(
             CheckDocumentAccessAction(
                 operation="CHECK_DOCUMENT_ACCESS",
                 document_ref="doc_bob",
-                session_handle=auth_result.session_handle,
+                session_alias=auth_result.session_alias,
             ),
             run_id,
             episode_id,
@@ -78,8 +78,18 @@ def test_real_http_idor_blue_control_and_target_evidence(tmp_path) -> None:
         assert vulnerable_result.http_status == 200
         assert vulnerable_result.target_event_id
         expected_target_event["id"] = str(vulnerable_result.target_event_id)
+        vulnerable_evidence = next(
+            item
+            for item in (json.loads(line) for line in evidence_path.read_text().splitlines())
+            if item["target_event_id"] == str(vulnerable_result.target_event_id)
+        )
         assert (
-            verify_document_access(vulnerable_job, vulnerable_result, fixture_seed=17)["status"]
+            verify_document_access(
+                vulnerable_job,
+                vulnerable_result,
+                fixture_seed=17,
+                target_evidence=vulnerable_evidence,
+            )["status"]
             == "confirmed"
         )
 
@@ -97,7 +107,7 @@ def test_real_http_idor_blue_control_and_target_evidence(tmp_path) -> None:
                 CheckDocumentAccessAction(
                     operation="CHECK_DOCUMENT_ACCESS",
                     document_ref="doc_bob",
-                    session_handle=auth_result.session_handle,
+                    session_alias=auth_result.session_alias,
                 ),
                 run_id,
                 episode_id,
@@ -118,7 +128,7 @@ def test_real_http_idor_blue_control_and_target_evidence(tmp_path) -> None:
             CheckDocumentAccessAction(
                 operation="CHECK_DOCUMENT_ACCESS",
                 document_ref="doc_bob",
-                session_handle=bob_auth.session_handle,
+                session_alias=bob_auth.session_alias,
             ),
             run_id,
             episode_id,
@@ -126,8 +136,15 @@ def test_real_http_idor_blue_control_and_target_evidence(tmp_path) -> None:
         )
         bob_access = await executor.execute(bob_access_job)
         assert bob_access.http_status == 200
+        bob_evidence = next(
+            item
+            for item in (json.loads(line) for line in evidence_path.read_text().splitlines())
+            if item["target_event_id"] == str(bob_access.target_event_id)
+        )
         assert (
-            verify_document_access(bob_access_job, bob_access, fixture_seed=17)["status"]
+            verify_document_access(
+                bob_access_job, bob_access, fixture_seed=17, target_evidence=bob_evidence
+            )["status"]
             == "failed"
         )
         await executor.close()

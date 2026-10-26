@@ -1,4 +1,4 @@
-"""Schema validation for the persisted training-transition API contract."""
+"""Validation tests for the current real-range training API contract."""
 
 from __future__ import annotations
 
@@ -7,94 +7,104 @@ from uuid import uuid4
 import pytest
 from pydantic import ValidationError
 
-from violet.api.range import (
-    EpisodeResultRequest,
-    LearningTransitionRequest,
-    LearningUpdateRequest,
+from violet.api.range import DecisionSubmission, TrainingRunRequest, TrainingUpdate
+from violet.range.contracts import (
+    AgentDecision,
+    PolicySample,
+    RangeObservation,
+    TransitionSubmission,
 )
+from violet.range.observations import RED_ACTION_CATALOG_V2, encode_observation
 
 
-def _payload(role: str = "red") -> dict[str, object]:
-    size, actions = (7, 8) if role == "red" else (8, 4)
-    return {
-        "run_id": str(uuid4()),
-        "episode_id": str(uuid4()),
-        "seed": 42,
-        "role": role,
-        "schema_id": "violet.range.observation.v2",
-        "observation": [0.0] * size,
-        "proposed_action": 0,
-        "action_mask": [True] * actions,
-        "accepted": True,
-        "executed_action": 0,
-        "reward": 0.0,
-        "reward_components": {"no_verified_outcome": 0.0},
-        "next_observation": [0.0] * size,
-        "next_value": 0.0,
-        "terminated": False,
-        "truncated": True,
-        "policy_version": 0,
-        "selected_action_probability": 0.5,
-        "policy_entropy": 0.69,
-        "mode": "training",
-    }
+def test_training_is_joint_and_research_minimums_are_enforced() -> None:
+    with pytest.raises(ValidationError, match="together"):
+        TrainingRunRequest(role="red", mode="train")
+    with pytest.raises(ValidationError, match="10,000"):
+        TrainingRunRequest(role="joint", run_kind="research", mode="train", episodes=9999)
+    with pytest.raises(ValidationError, match="100 paired"):
+        TrainingRunRequest(
+            role="joint",
+            run_kind="research",
+            mode="evaluate",
+            episodes=99,
+            checkpoint_run_id=uuid4(),
+        )
+    teaching = TrainingRunRequest(role="joint", mode="train", episodes=1)
+    assert teaching.run_kind == "teaching"
 
 
-@pytest.mark.parametrize("role", ["red", "blue"])
-def test_role_specific_observation_contract_accepts_valid_transition(role: str) -> None:
-    assert LearningTransitionRequest.model_validate(_payload(role)).role == role
-
-
-def test_observation_schema_and_terminal_flags_are_validated() -> None:
-    stale = _payload()
-    stale["schema_id"] = "violet.range.observation.v1"
-    with pytest.raises(ValidationError):
-        LearningTransitionRequest.model_validate(stale)
-    both_endings = _payload()
-    both_endings["terminated"] = True
-    with pytest.raises(ValidationError, match="both"):
-        LearningTransitionRequest.model_validate(both_endings)
-
-
-def test_rejected_action_cannot_be_recorded_as_executed() -> None:
-    invalid = _payload()
-    invalid["accepted"] = False
-    with pytest.raises(ValidationError, match="accepted transitions"):
-        LearningTransitionRequest.model_validate(invalid)
-
-
-def test_update_metrics_accept_gradient_and_advantage_diagnostics() -> None:
-    request = LearningUpdateRequest(
-        run_id=uuid4(),
-        episode_id=uuid4(),
-        seed=42,
+def test_joint_optimizer_updates_identify_the_role_that_was_updated() -> None:
+    red_update = TrainingUpdate(
+        worker_id="trainer-1",
         role="red",
-        policy_version=1,
-        transition_count=6,
-        metrics={
-            "loss": 0.1,
-            "policy_loss": 0.0,
-            "value_loss": 0.2,
-            "entropy": 1.0,
-            "clip_fraction": 0.0,
-            "gradient_norm": 0.3,
-            "optimizer_steps": 4.0,
-            "advantage_mean": 0.0,
-            "advantage_std": 1.0,
-            "advantage_min": -1.0,
-            "advantage_max": 1.0,
-        },
+        result={"update_index": 1, "global_step": 2, "metrics": {"loss": 0.25}},
     )
-    assert request.metrics["gradient_norm"] == 0.3
+    blue_update = TrainingUpdate(
+        worker_id="trainer-1",
+        role="blue",
+        result={"update_index": 1, "global_step": 2, "metrics": {"loss": 0.5}},
+    )
+    assert red_update.role == "red"
+    assert blue_update.role == "blue"
 
 
-def test_episode_lifecycle_rejects_inconsistent_failed_run() -> None:
-    with pytest.raises(ValidationError, match="failed episode"):
-        EpisodeResultRequest(
-            run_id=uuid4(),
-            episode_id=uuid4(),
-            seed=42,
-            episode_status="failed",
-            run_status="completed",
-            summary={},
+def test_decision_requires_policy_sample_to_match_observation_and_action() -> None:
+    run_id, episode_id = uuid4(), uuid4()
+    action_count = len(RED_ACTION_CATALOG_V2)
+    observation = RangeObservation(
+        schema_id="red.range_observation.v2",
+        run_id=run_id,
+        episode_id=episode_id,
+        step_id=0,
+        remaining_requests=40,
+        legal_action_mask=tuple(index == 9 for index in range(action_count)),
+    )
+    sample = PolicySample(
+        encoding_schema_id="violet.range.features.v2",
+        encoded_observation=encode_observation(observation),
+        action_distribution=tuple(1.0 if index == 9 else 0.0 for index in range(action_count)),
+        selected_action_index=9,
+        selected_action_probability=1.0,
+        old_log_probability=0.0,
+        value_estimate=0.0,
+        entropy=0.0,
+        policy_version=0,
+        mode="train",
+    )
+    decision = AgentDecision(
+        decision_id=uuid4(),
+        run_id=run_id,
+        episode_id=episode_id,
+        step_id=0,
+        role="red",
+        policy_id="red-range-test",
+        observation_schema_id="red.range_observation.v2",
+        legal_action_mask=observation.legal_action_mask,
+        selected_action={"operation": "WAIT"},
+        inference_ms=0,
+        policy_sample=sample,
+    )
+    submission = DecisionSubmission(decision=decision, observation=observation)
+    assert submission.decision.policy_sample == sample
+
+
+def test_transition_cannot_be_both_terminated_and_truncated() -> None:
+    run_id, episode_id = uuid4(), uuid4()
+    observation = RangeObservation(
+        schema_id="red.range_observation.v2",
+        run_id=run_id,
+        episode_id=episode_id,
+        step_id=1,
+        remaining_requests=39,
+        legal_action_mask=(True,),
+    )
+    with pytest.raises(ValidationError, match="both"):
+        TransitionSubmission(
+            decision_id=uuid4(),
+            next_observation=observation,
+            next_value=0,
+            terminated=True,
+            truncated=True,
+            mode="train",
         )

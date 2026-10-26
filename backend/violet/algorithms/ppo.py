@@ -185,8 +185,12 @@ class RolloutBuffer:
             truncations=truncated,
             next_values=[t.next_value for t in self.transitions],
         )
-        # Normalize advantages (standard PPO trick; harmless for single traj too)
-        adv = (adv - adv.mean()) / (adv.std() + 1e-8)
+        # A one-transition episode has no variance to normalize. Keeping its
+        # raw advantage preserves the policy gradient instead of zeroing it.
+        if len(adv) > 1:
+            std = adv.std()
+            if std > 1e-8:
+                adv = (adv - adv.mean()) / std
         self.advantages = adv
         self.returns = ret
 

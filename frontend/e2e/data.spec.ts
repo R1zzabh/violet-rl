@@ -6,6 +6,7 @@ test.describe("training (real metrics)", () => {
     await page.goto("/training");
     // Real run id produced by the training loop (registry row cell)
     await expect(page.locator("td", { hasText: "ppo_red_v1" }).first()).toBeVisible({ timeout: 15_000 });
+    await page.locator("tr", { hasText: "ppo_red_v1" }).first().click();
     // Metric charts render with real axis labels (global_step range from training.jsonl)
     await expect(page.getByText(/Mean episode reward per update — run ppo_red_v1/)).toBeVisible();
     await expect(page.locator("svg[aria-label='mean_episode_reward']")).toBeVisible();
@@ -17,6 +18,7 @@ test.describe("training (real metrics)", () => {
 test.describe("evaluation (real artifacts)", () => {
   test("cross-matchup table renders real rates", async ({ page }) => {
     await page.goto("/evaluation");
+    await page.getByRole("combobox").selectOption("ppo_red_v1");
     await expect(page.getByText("CROSS-MATCHUP SUMMARY — run ppo_red_v1")).toBeVisible({ timeout: 15_000 });
     await expect(page.getByText("Attack success")).toBeVisible();
     // Real generated timestamp appears

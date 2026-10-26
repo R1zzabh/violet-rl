@@ -51,7 +51,19 @@ class TargetDatabase:
             {"check_same_thread": False} if url.startswith("sqlite") else {}
         )
         self.engine: Engine = create_engine(url, pool_pre_ping=True, connect_args=connect_args)
-        metadata.create_all(self.engine)
+        # Local test fixtures may use SQLite. PostgreSQL is initialized only
+        # by the database-scoped target-migrate service.
+        if self.engine.dialect.name == "sqlite":
+            metadata.create_all(self.engine)
+        else:
+            from sqlalchemy import inspect
+
+            missing = set(metadata.tables) - set(inspect(self.engine).get_table_names())
+            if missing:
+                raise RuntimeError(
+                    "Violet Ledger database schema is not migrated; run target-migrate "
+                    f"(missing: {', '.join(sorted(missing))})"
+                )
         with self.engine.connect() as connection:
             has_fixtures = connection.execute(select(users.c.user_ref).limit(1)).first() is not None
         if not has_fixtures:
@@ -123,7 +135,7 @@ class TargetDatabase:
     @property
     def fixture_seed(self) -> int:
         with self.engine.connect() as connection:
-            value = connection.execute(
+            value: str = connection.execute(
                 select(range_state.c.value).where(range_state.c.key == "fixture_seed")
             ).scalar_one()
         return int(value)

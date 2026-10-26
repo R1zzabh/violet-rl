@@ -18,14 +18,14 @@ export type StatusKey =
   | "RECOVERING";
 
 export const STATUS_COLORS: Record<StatusKey, string> = {
-  SAFE: "#2ecc71",
-  DISCOVERED: "#f5c518",
-  SUSPICIOUS: "#ff9f1a",
-  COMPROMISED: "#ff2a2a",
-  ISOLATED: "#888888",
-  PATCHED: "#2a7aff",
-  DECOY: "#9b59ff",
-  RECOVERING: "#00b8a9",
+  SAFE: "#8fc49a",
+  DISCOVERED: "#d4af37",
+  SUSPICIOUS: "#f07832",
+  COMPROMISED: "#ff7868",
+  ISOLATED: "#8f7965",
+  PATCHED: "#79b8ff",
+  DECOY: "#c78b48",
+  RECOVERING: "#b69c82",
 };
 
 const STATUS_ORDER: StatusKey[] = [
@@ -127,7 +127,7 @@ export default function NetworkGraph({ network }: { network: NetworkSnapshot | n
 
   if (!geo || !network) {
     return (
-      <div className="border-2 border-[#222] p-6 mono text-xs text-muted-foreground">
+      <div className="rounded-lg border border-[#d4af37]/15 bg-[#130d09]/70 p-6 mono text-xs text-muted-foreground">
         NO NETWORK DATA — START A SIMULATION TO LOAD TOPOLOGY
       </div>
     );
@@ -159,8 +159,8 @@ export default function NetworkGraph({ network }: { network: NetworkSnapshot | n
             const alertHigh = network.active_alerts[e.to] && network.active_alerts[e.to] !== "none";
             return (
               <g key={`e-${i}`}>
-                <line x1={x1} y1={y1} x2={x2} y2={y2} stroke={alertHigh ? "#f5c518" : "#2a2a2a"} strokeWidth={alertHigh ? 3 : 2} />
-                <circle cx={(x1 + x2) / 2} cy={(y1 + y2) / 2} r={2} fill="#3a3a3a" />
+              <line x1={x1} y1={y1} x2={x2} y2={y2} stroke={alertHigh ? "#d4af37" : "#604733"} strokeWidth={alertHigh ? 3 : 2} />
+              <circle cx={(x1 + x2) / 2} cy={(y1 + y2) / 2} r={2} fill="#8f7965" />
               </g>
               );
           })}
@@ -177,32 +177,32 @@ export default function NetworkGraph({ network }: { network: NetworkSnapshot | n
                   y={4}
                   width={NW}
                   height={NH}
-                  fill="#000"
-                  opacity={0.9}
+                  fill="#0d0806"
+                  opacity={0.72}
                 />
                 <rect
                   x={0}
                   y={0}
                   width={NW}
                   height={NH}
-                  fill="#141414"
-                  stroke={isComp ? color : "#3a3a3a"}
+                  fill="#24170f"
+                  stroke={isComp ? color : "rgba(212,175,55,.26)"}
                   strokeWidth={isComp ? 3 : 2}
                 />
                 <rect x={0} y={NH - 6} width={NW} height={6} fill={color} />
-                <text x={NW / 2} y={18} textAnchor="middle" fill="#f5f5f5" fontSize={11} fontWeight={700} fontFamily="'Space Mono', monospace">
+                <text x={NW / 2} y={18} textAnchor="middle" fill="#f5e6d0" fontSize={11} fontWeight={700} fontFamily="'Space Mono', monospace">
                   {n.label}
                 </text>
                 <text x={NW / 2} y={32} textAnchor="middle" fill={color} fontSize={8} fontFamily="'Space Mono', monospace">
                   {status}
                 </text>
                 {n.node.is_critical_asset && (
-                  <text x={8} y={16} fontSize={9} fill="#f5c518">
+                  <text x={8} y={16} fontSize={9} fill="#d4af37">
                     ★
                   </text>
                 )}
                 {n.node.is_honeypot && (
-                  <text x={NW - 14} y={16} fontSize={9} fill="#9b59ff">
+                  <text x={NW - 14} y={16} fontSize={9} fill="#c78b48">
                     ◆
                   </text>
                 )}

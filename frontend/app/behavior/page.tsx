@@ -20,7 +20,7 @@ function Heatmap({ data, title }: { data: Record<string, Record<string, number>>
 
   if (states.length === 0) {
     return (
-      <div className="mono text-xs text-muted-foreground p-4 border border-[#222]">
+      <div className="mono text-xs text-muted-foreground rounded-lg border border-[rgba(212,175,55,.15)] bg-[rgba(19,13,9,.62)] p-4">
         NOT AVAILABLE — no conditioned trajectory data in this report.
       </div>
     );
@@ -28,8 +28,8 @@ function Heatmap({ data, title }: { data: Record<string, Record<string, number>>
 
   const fill = (v: number) =>
     v === 0
-      ? "#161616"
-      : `rgb(${Math.round(255 * (v / max))}, ${Math.round(60 * (1 - v / max))}, ${Math.round(180 * (1 - v / max))})`;
+      ? "#21150e"
+      : `rgb(${Math.round(212 * (v / max) + 54 * (1 - v / max))}, ${Math.round(175 * (v / max) + 36 * (1 - v / max))}, ${Math.round(55 * (v / max) + 20 * (1 - v / max))})`;
 
   return (
     <div className="overflow-x-auto">
@@ -54,8 +54,8 @@ function Heatmap({ data, title }: { data: Record<string, Record<string, number>>
                 return (
                   <td key={a} className="text-center mono">
                     <span
-                      className="inline-block w-9 h-6 border border-black leading-6"
-                      style={{ backgroundColor: fill(v), color: v / max > 0.5 ? "#000" : "#9a9a9a" }}
+                      className="inline-block w-9 h-6 rounded border border-[rgba(212,175,55,.22)] leading-6"
+                      style={{ backgroundColor: fill(v), color: v / max > 0.5 ? "#1a110d" : "#c1aa91" }}
                     >
                       {v}
                     </span>
@@ -98,8 +98,8 @@ function BehaviorCards({
             <span
               className="badge-brutal mono"
               style={{
-                borderColor: b.confidence === "HIGH" ? "#2ecc71" : "#f5c518",
-                color: b.confidence === "HIGH" ? "#2ecc71" : "#f5c518",
+                borderColor: b.confidence === "HIGH" ? "#8fc49a" : "#d4af37",
+                color: b.confidence === "HIGH" ? "#8fc49a" : "#d4af37",
               }}
             >
               confidence {b.confidence}
@@ -114,10 +114,10 @@ function BehaviorCards({
               <div className="section-label mb-1">Observed behavior</div>
               <div className="text-white font-semibold">{b.observed_behavior}</div>
             </div>
-            <div className="flex gap-6 pt-2 border-t border-[#222]">
+            <div className="flex gap-6 pt-2 border-t border-[rgba(212,175,55,.12)]">
               <div>
                 <div className="section-label mb-1">Frequency</div>
-                <span className="mono text-violet-400 font-bold">{b.frequency}</span>
+                <span className="mono text-[#d4af37] font-bold">{b.frequency}</span>
               </div>
               <div>
                 <div className="section-label mb-1">Baseline</div>
@@ -126,7 +126,7 @@ function BehaviorCards({
             </div>
             <div className="mono text-[11px] text-muted-foreground">{b.improvement}</div>
             {b.side_effects && b.side_effects.length > 0 && (
-              <div className="mono text-[11px] text-yellow-400">side effects: {b.side_effects.join("; ")}</div>
+              <div className="mono text-[11px] text-[#e3c879]">side effects: {b.side_effects.join("; ")}</div>
             )}
           </div>
         </div>
@@ -179,7 +179,7 @@ export default function BehaviorPage() {
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div>
           <div className="flex items-center gap-2 mb-1">
-            <Search size={14} className="text-violet-400" />
+            <Search size={14} className="text-[#d4af37]" />
             <span className="text-xs mono uppercase tracking-[0.2em] text-muted-foreground font-bold">
               Behavior Discovery Engine
             </span>
@@ -189,7 +189,7 @@ export default function BehaviorPage() {
         <div className="flex items-center gap-2">
           {runs.length > 0 && (
             <select
-              className="border-2 border-[#333] bg-[#111] px-2 py-1.5 mono text-xs"
+              className="select-brutal min-w-52 py-1.5"
               value={runId ?? ""}
               onChange={(e) => setRunId(e.target.value)}
             >
@@ -206,11 +206,11 @@ export default function BehaviorPage() {
         </div>
       </div>
 
-      <div className="card-brutal bg-[#111] border-yellow-500 border-2">
+      <div className="panel border-[#d4af37]/30 bg-[#24170f]">
         <div className="flex items-start gap-3">
-          <AlertTriangle size={16} className="text-yellow-400 shrink-0 mt-0.5" />
+          <AlertTriangle size={16} className="text-[#d4af37] shrink-0 mt-0.5" />
           <div className="text-sm">
-            <span className="mono uppercase tracking-[0.12em] text-yellow-400 font-bold text-xs">Methodology</span>
+            <span className="mono uppercase tracking-[0.12em] text-[#d4af37] font-bold text-xs">Methodology</span>
             <p className="text-muted-foreground mt-1 leading-relaxed">
               Behaviors are discovered by analyzing stored evaluation trajectories
               (runs/&lt;run_id&gt;/evaluation/). Each card reports the measured selection frequency
@@ -228,7 +228,7 @@ export default function BehaviorPage() {
           <p className="text-sm text-muted-foreground">{error}</p>
           <p className="text-xs mono text-muted-foreground mt-2">
             Behavior artifacts are generated by{" "}
-            <code className="text-violet-400">backend/scripts/generate_eval_artifacts.py</code> after training.
+            <code className="text-[#d4af37]">backend/scripts/generate_eval_artifacts.py</code> after training.
           </p>
         </div>
       )}
@@ -240,7 +240,7 @@ export default function BehaviorPage() {
               <span className="status-dot status-dot-red" />
               <h2 className="text-lg font-bold tracking-tight">🔴 RED — observed policy tendencies</h2>
             </div>
-            <BehaviorCards behaviors={report.red_behaviors} accent="#ff2a2a" />
+            <BehaviorCards behaviors={report.red_behaviors} accent="#f07832" />
           </section>
 
           <section>
@@ -248,7 +248,7 @@ export default function BehaviorPage() {
               <span className="status-dot status-dot-blue" />
               <h2 className="text-lg font-bold tracking-tight">🔵 BLUE — observed policy tendencies</h2>
             </div>
-            <BehaviorCards behaviors={report.blue_behaviors} accent="#2a7aff" />
+            <BehaviorCards behaviors={report.blue_behaviors} accent="#79b8ff" />
           </section>
 
           <section className="card-brutal-lg space-y-6">
@@ -258,7 +258,7 @@ export default function BehaviorPage() {
           </section>
 
           <p className="mono text-[11px] text-muted-foreground">
-            Source: <span className="text-violet-400">backend/runs/{report.run_id}/evaluation/behavior_report.json</span>
+            Source: <span className="text-[#d4af37]">backend/runs/{report.run_id}/evaluation/behavior_report.json</span>
           </p>
         </>
       )}

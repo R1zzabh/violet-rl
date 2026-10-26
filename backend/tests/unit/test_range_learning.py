@@ -9,7 +9,7 @@ pytest.importorskip("torch", reason="range PPO tests require the optional rl ext
 
 import torch
 
-from violet.algorithms.ppo import compute_gae
+from violet.algorithms.ppo import RolloutBuffer, Transition, compute_gae
 from violet.range.learning import (
     RangeObservation,
     RangePPOAgent,
@@ -44,6 +44,26 @@ def test_truncation_bootstraps_value_but_ends_gae_trace() -> None:
         next_values=[2.0],
     )
     assert np.allclose(terminal_adv, [0.5])
+
+
+def test_single_transition_rollout_keeps_policy_advantage() -> None:
+    buffer = RolloutBuffer()
+    buffer.add(
+        Transition(
+            obs=np.zeros(2, dtype=np.float32),
+            mask=np.asarray([True, True]),
+            action=0,
+            log_prob=-0.69,
+            value=0.2,
+            reward=1.0,
+            terminated=False,
+            truncated=True,
+            next_value=0.3,
+        )
+    )
+    buffer.finalize(0.0, 0.99, 0.95)
+    assert buffer.advantages is not None
+    assert buffer.advantages[0] == pytest.approx(1.097)
 
 
 def _fill_rollout(agent: RangePPOAgent, rewards: tuple[float, ...]) -> None:

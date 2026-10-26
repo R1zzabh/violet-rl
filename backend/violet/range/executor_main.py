@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-import secrets
+import re
 import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -63,7 +63,11 @@ def _safe_excerpt(response: httpx.Response) -> str:
     try:
         payload = response.json()
     except (ValueError, UnicodeDecodeError):
-        return response.text[:2048]
+        plain = response.text
+        pattern = re.compile(
+            r"(?i)(password|cookie|token|authorization|credential)(\s*[:=]\s*)(\"[^\"]*\"|'[^']*'|[^\s,;]+)"
+        )
+        return pattern.sub(r"\1\2[REDACTED]", plain)[:2048]
 
     def scrub(value: Any) -> Any:
         if isinstance(value, dict):
@@ -89,6 +93,7 @@ def _safe_excerpt(response: httpx.Response) -> str:
 class ExecutorSession:
     client: httpx.AsyncClient
     principal_ref: str
+    created_at: float
 
 
 class RangeExecutor:
@@ -122,6 +127,25 @@ class RangeExecutor:
         }
         self.last_heartbeat_at = 0.0
 
+    async def _prune_sessions(self) -> None:
+        now = time.monotonic()
+        expired = [
+            alias for alias, session in self.sessions.items() if now - session.created_at > 300.0
+        ]
+        if len(self.sessions) - len(expired) > 128:
+            remaining = sorted(
+                (
+                    (session.created_at, alias)
+                    for alias, session in self.sessions.items()
+                    if alias not in expired
+                )
+            )
+            expired.extend(alias for _created_at, alias in remaining[: len(self.sessions) - 128])
+        for alias in set(expired):
+            session = self.sessions.pop(alias, None)
+            if session is not None:
+                await session.client.aclose()
+
     def _new_client(self) -> httpx.AsyncClient:
         options = dict(self.client_options)
         if self.transport_factory is not None:
@@ -153,53 +177,72 @@ class RangeExecutor:
             if result.exists():
                 in_progress.unlink(missing_ok=True)
             else:
-                destination = self.jobs_dir / in_progress.name
-                if not destination.exists():
-                    os.replace(in_progress, destination)
+                # The target may have applied this request before the worker died.
+                # Never replay it blindly; preserve the job and force an explicit
+                # incomplete outcome for API reconciliation and operator review.
+                try:
+                    job = ExecutorJob.model_validate(read_json(in_progress))
+                    started_at = utc_now()
+                    unknown = self._result(
+                        job,
+                        "outcome_unknown",
+                        started_at,
+                        time.monotonic(),
+                        error_code="executor_restarted_in_flight",
+                    )
+                    write_json_atomic(result, unknown.model_dump(mode="json"))
+                    in_progress.unlink(missing_ok=True)
+                except Exception:
+                    # Corrupt in-flight records stay quarantined and are not executed.
+                    continue
 
     async def execute(self, job: ExecutorJob) -> ExecutorResult:
+        await self._prune_sessions()
         started_at = utc_now()
         started = time.monotonic()
         action = job.action
         client: httpx.AsyncClient | None = None
         should_close_client = True
         principal_ref: str | None = None
-        session_handle: str | None = None
+        session_alias: str | None = None
+        route_catalog_id: str | None = None
         method: str
         path: str
         json_body: dict[str, str] | None = None
 
-        if not isinstance(action, CheckTargetHealthAction):
-            if not self.budget_ledger_valid:
-                return self._result(
-                    job, "rejected", started_at, started, error_code="request_budget_exhausted"
-                )
-            budget_key = f"{job.run_id}:{job.episode_id}"
-            current = self.episode_budgets.get(budget_key)
-            if current is None:
-                current = {"count": 0.0, "started_at": time.time()}
-            if current["count"] >= 40:
-                return self._result(
-                    job, "rejected", started_at, started, error_code="request_budget_exhausted"
-                )
-            if time.time() - current["started_at"] > 300:
-                return self._result(
-                    job, "rejected", started_at, started, error_code="episode_deadline_exceeded"
-                )
-            current["count"] += 1
-            self.episode_budgets[budget_key] = current
-            write_json_atomic(self.spool / "episode-budgets.json", self.episode_budgets)
+        if not self.budget_ledger_valid:
+            return self._result(
+                job, "rejected", started_at, started, error_code="request_budget_exhausted"
+            )
+        budget_key = f"{job.run_id}:{job.episode_id}"
+        current = self.episode_budgets.get(budget_key)
+        if current is None:
+            current = {"count": 0.0, "started_at": time.time()}
+        if current["count"] >= 40:
+            return self._result(
+                job, "rejected", started_at, started, error_code="request_budget_exhausted"
+            )
+        if time.time() - current["started_at"] > 300:
+            return self._result(
+                job, "rejected", started_at, started, error_code="episode_deadline_exceeded"
+            )
+        current["count"] += 1
+        self.episode_budgets[budget_key] = current
+        write_json_atomic(self.spool / "episode-budgets.json", self.episode_budgets)
 
         if isinstance(action, DiscoverRouteAction):
+            route_catalog_id = action.route_candidate_id
             method, path = ROUTES[action.route_candidate_id]
             client = self._new_client()
         elif isinstance(action, AuthTestAction):
+            route_catalog_id = "login"
             method, path = "POST", "/api/login"
             client = self._new_client()
             json_body = {"credential_ref": action.credential_ref}
         elif isinstance(action, CheckDocumentAccessAction):
+            route_catalog_id = "document"
             method, path = "GET", f"/api/documents/{action.document_ref}"
-            if action.session_handle is None or action.session_handle not in self.sessions:
+            if action.session_alias is None or action.session_alias not in self.sessions:
                 return self._result(
                     job,
                     "rejected",
@@ -207,11 +250,12 @@ class RangeExecutor:
                     started,
                     error_code="unknown_session",
                 )
-            session = self.sessions[action.session_handle]
+            session = self.sessions[action.session_alias]
             client = session.client
             principal_ref = session.principal_ref
             should_close_client = False
         elif isinstance(action, CheckTargetHealthAction):
+            route_catalog_id = "health"
             method, path = "GET", "/health"
             client = self._new_client()
         else:  # pragma: no cover - the union fails closed before dispatch
@@ -243,8 +287,11 @@ class RangeExecutor:
                     else None
                 )
                 if principal_ref:
-                    session_handle = secrets.token_urlsafe(32)
-                    self.sessions[session_handle] = ExecutorSession(client, principal_ref)
+                    session_alias = f"session-{job.action_id.hex[:12]}"
+                    # Cookie jar stays inside the executor; only this alias is persisted.
+                    self.sessions[session_alias] = ExecutorSession(
+                        client, principal_ref, time.monotonic()
+                    )
                     client = None
             result = self._result(
                 job,
@@ -252,10 +299,22 @@ class RangeExecutor:
                 started_at,
                 started,
                 http_status=response.status_code,
+                method=method,
+                route_catalog_id=route_catalog_id,
+                response_headers={
+                    key.lower(): response.headers[key]
+                    for key in (
+                        "content-type",
+                        "cache-control",
+                        "x-violet-target-event-id",
+                        "x-violet-target-version",
+                    )
+                    if key in response.headers
+                },
                 content_type=response.headers.get("content-type"),
                 response_excerpt=body_text,
                 target_event_id=target_event_id,
-                session_handle=session_handle,
+                session_alias=session_alias,
                 principal_ref=principal_ref,
             )
             return result
@@ -277,10 +336,13 @@ class RangeExecutor:
         started: float,
         *,
         http_status: int | None = None,
+        method: str | None = None,
+        route_catalog_id: str | None = None,
+        response_headers: dict[str, str] | None = None,
         content_type: str | None = None,
         response_excerpt: str = "",
         target_event_id: UUID | None = None,
-        session_handle: str | None = None,
+        session_alias: str | None = None,
         principal_ref: str | None = None,
         error_code: str | None = None,
     ) -> ExecutorResult:
@@ -290,11 +352,14 @@ class RangeExecutor:
             action_id=job.action_id,
             request_id=job.request_id,
             status=status,  # type: ignore[arg-type]
+            method=method,  # type: ignore[arg-type]
+            route_catalog_id=route_catalog_id,  # type: ignore[arg-type]
+            response_headers=response_headers or {},
             http_status=http_status,
             content_type=content_type,
             response_excerpt=response_excerpt,
             target_event_id=target_event_id,
-            session_handle=session_handle,
+            session_alias=session_alias,
             principal_ref=principal_ref,  # type: ignore[arg-type]
             error_code=error_code,  # type: ignore[arg-type]
             started_at=started_at,

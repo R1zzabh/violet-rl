@@ -35,7 +35,7 @@ export default function NetworkPage() {
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div>
           <div className="flex items-center gap-2 mb-1">
-            <NetworkIcon size={14} className="text-violet-400" />
+            <NetworkIcon size={14} className="text-[#d4af37]" />
             <span className="text-xs mono uppercase tracking-[0.2em] text-muted-foreground font-bold">
               Network Explorer
             </span>
@@ -94,7 +94,7 @@ export default function NetworkPage() {
                 <tbody>
                   {nodes.map((n) => (
                     <tr key={n.id}>
-                      <td className="mono font-bold text-white whitespace-nowrap">{n.label}</td>
+                      <td className="mono font-bold text-[#eadcc8] whitespace-nowrap">{n.label}</td>
                       <td className="mono">{n.node_type}</td>
                       <td className="mono">{n.value}</td>
                       <td>{n.is_critical_asset ? "★" : ""}</td>

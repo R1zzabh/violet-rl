@@ -11,15 +11,15 @@ import NetworkGraph from "@/components/network-graph";
 import { useSimulation } from "@/lib/use-simulation";
 
 const EVENT_COLORS: Record<string, string> = {
-  red: "#ff2a2a",
-  blue: "#2a7aff",
-  system: "#f5c518",
+  red: "#f07832",
+  blue: "#79b8ff",
+  system: "#d4af37",
 };
 
 function EventRow({ ev }: { ev: import("@/lib/use-simulation").SimEvent }) {
-  const color = EVENT_COLORS[ev.agent] ?? "#9a9a9a";
+  const color = EVENT_COLORS[ev.agent] ?? "#8f7965";
   return (
-    <div className="flex items-start gap-2 border-b border-[#1c1c1c] py-1.5 last:border-0">
+    <div className="flex items-start gap-2 border-b border-[rgba(212,175,55,.1)] py-1.5 last:border-0">
       <span className="mono text-[10px] text-muted-foreground w-10 shrink-0 text-right">
         {ev.step ?? "—"}
       </span>
@@ -31,7 +31,7 @@ function EventRow({ ev }: { ev: import("@/lib/use-simulation").SimEvent }) {
       </span>
       <span className="mono text-[11px] text-white shrink-0">→ {ev.action}</span>
       {ev.target && (
-        <span className="mono text-[11px] text-violet-400 shrink-0">{ev.target}</span>
+        <span className="mono text-[11px] text-[#d4af37] shrink-0">{ev.target}</span>
       )}
       <span className="mono text-[10px] text-muted-foreground truncate">{ev.result}</span>
     </div>
@@ -40,18 +40,18 @@ function EventRow({ ev }: { ev: import("@/lib/use-simulation").SimEvent }) {
 
 function phaseBadge(phase: string, wsStatus: string | null) {
   const map: Record<string, { label: string; color: string }> = {
-    idle: { label: "IDLE", color: "#6a6a6a" },
-    "loading-config": { label: "LOADING", color: "#f5c518" },
-    "config-error": { label: "CONFIG ERROR", color: "#ff2a2a" },
-    ready: { label: "READY", color: "#2ecc71" },
-    "creating-session": { label: "CREATING", color: "#f5c518" },
-    connecting: { label: "CONNECTING", color: "#f5c518" },
-    live: { label: "LIVE", color: "#ff2a2a" },
-    paused: { label: "PAUSED", color: "#f5c518" },
-    ended: { label: "ENDED", color: "#2a7aff" },
-    "backend-down": { label: "BACKEND DOWN", color: "#ff2a2a" },
+    idle: { label: "IDLE", color: "#8f7965" },
+    "loading-config": { label: "LOADING", color: "#d4af37" },
+    "config-error": { label: "CONFIG ERROR", color: "#ff7868" },
+    ready: { label: "READY", color: "#8fc49a" },
+    "creating-session": { label: "CREATING", color: "#d4af37" },
+    connecting: { label: "CONNECTING", color: "#d4af37" },
+    live: { label: "LIVE", color: "#f07832" },
+    paused: { label: "PAUSED", color: "#d4af37" },
+    ended: { label: "ENDED", color: "#79b8ff" },
+    "backend-down": { label: "BACKEND DOWN", color: "#ff7868" },
   };
-  const badge = map[phase] ?? { label: phase.toUpperCase(), color: "#6a6a6a" };
+  const badge = map[phase] ?? { label: phase.toUpperCase(), color: "#8f7965" };
   return (
     <span className="flex items-center gap-3">
       {wsStatus && (
@@ -113,7 +113,7 @@ function SimulationInner() {
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div>
           <div className="flex items-center gap-2 mb-1">
-            <Activity size={14} className="text-violet-400" />
+            <Activity size={14} className="text-[#d4af37]" />
             <span className="text-xs mono uppercase tracking-[0.2em] text-muted-foreground font-bold">
               VIOLET — LIVE BATTLE
             </span>
@@ -134,14 +134,14 @@ function SimulationInner() {
       </div>
 
       {state.phase === "backend-down" && (
-        <div className="card-brutal border-red-500 border-2 p-4">
-          <div className="mono text-xs font-bold text-red-400 uppercase mb-1">
+        <div className="panel border-[#ff7868]/35 p-4">
+          <div className="mono text-xs font-bold text-[#ff9b8e] uppercase mb-1">
             Backend unavailable
           </div>
           <p className="text-sm text-muted-foreground">
             {state.configError || "Could not reach the VIOLET API."} Start it with{" "}
-            <code className="mono text-violet-400">uvicorn violet.api.app:app --port 8000</code>{" "}
-            (or <code className="mono text-violet-400">docker compose up</code>) and retry.
+            <code className="mono text-[#d4af37]">uvicorn violet.api.app:app --port 8000</code>{" "}
+            (or <code className="mono text-[#d4af37]">docker compose up</code>) and retry.
           </p>
         </div>
       )}
@@ -153,7 +153,7 @@ function SimulationInner() {
           <label className="block">
             <span className="mono text-[10px] uppercase text-muted-foreground tracking-wider">Scenario</span>
             <select
-              className="w-full mt-1 border-2 border-[#333] bg-[#111] px-2 py-1.5 mono text-xs"
+              className="select-brutal mt-1"
               value={state.scenarioId}
               onChange={(e) => sim.setConfig("scenarioId", e.target.value)}
               disabled={state.phase === "live"}
@@ -169,7 +169,7 @@ function SimulationInner() {
           <label className="block">
             <span className="mono text-[10px] uppercase text-muted-foreground tracking-wider">Red agent</span>
             <select
-              className="w-full mt-1 border-2 border-[#333] bg-[#111] px-2 py-1.5 mono text-xs"
+              className="select-brutal mt-1"
               value={state.redPolicy}
               onChange={(e) => sim.setConfig("redPolicy", e.target.value)}
               disabled={state.phase === "live"}
@@ -186,7 +186,7 @@ function SimulationInner() {
           <label className="block">
             <span className="mono text-[10px] uppercase text-muted-foreground tracking-wider">Blue agent</span>
             <select
-              className="w-full mt-1 border-2 border-[#333] bg-[#111] px-2 py-1.5 mono text-xs"
+              className="select-brutal mt-1"
               value={state.bluePolicy}
               onChange={(e) => sim.setConfig("bluePolicy", e.target.value)}
               disabled={state.phase === "live"}
@@ -203,14 +203,14 @@ function SimulationInner() {
             <span className="mono text-[10px] uppercase text-muted-foreground tracking-wider">Seed</span>
             <input
               type="number"
-              className="w-full mt-1 border-2 border-[#333] bg-[#111] px-2 py-1.5 mono text-xs"
+              className="input-brutal mt-1"
               value={state.seed}
               onChange={(e) => sim.setConfig("seed", Number(e.target.value) || 0)}
               disabled={state.phase === "live"}
             />
           </label>
         </div>
-        <div className="flex flex-wrap items-center gap-2 mt-4 pt-3 border-t border-[#222]">
+        <div className="flex flex-wrap items-center gap-2 mt-4 pt-3 border-t border-[rgba(212,175,55,.12)]">
           {!hasSession ? (
             <button
               className="btn-brutal btn-brutal-red btn-brutal-sm"
@@ -252,7 +252,7 @@ function SimulationInner() {
             </>
           )}
           {state.phase === "ended" && (
-            <span className="mono text-xs font-bold" style={{ color: state.winner === "red" ? "#ff2a2a" : state.winner === "blue" ? "#2a7aff" : "#f5c518" }}>
+            <span className="mono text-xs font-bold" style={{ color: state.winner === "red" ? "#f07832" : state.winner === "blue" ? "#79b8ff" : "#d4af37" }}>
               {state.outcome === "timeout"
                 ? "EPISODE TIMEOUT — undecided"
                 : state.winner === "red"
@@ -263,14 +263,14 @@ function SimulationInner() {
             </span>
           )}
           {state.configError && state.phase !== "backend-down" && (
-            <span className="mono text-xs text-red-400">⚠ {state.configError}</span>
+            <span className="mono text-xs text-[#ff9b8e]">⚠ {state.configError}</span>
           )}
         </div>
       </div>
 
       {/* ---------- AGENT PANELS ---------- */}
       <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-        <div className="card-brutal border-l-[6px]" style={{ borderLeftColor: "#ff2a2a" }}>
+        <div className="panel border-l-4" style={{ borderLeftColor: "#f07832" }}>
           <div className="section-label mb-3">🔴 RED — ATTACKER ({state.redPolicy})</div>
           <div className="grid grid-cols-[auto_1fr] gap-x-4 gap-y-1.5 text-sm mb-3">
             <span className="mono text-muted-foreground text-[10px] uppercase tracking-wider">Reward</span>
@@ -278,12 +278,12 @@ function SimulationInner() {
             <span className="mono text-muted-foreground text-[10px] uppercase tracking-wider">Last action</span>
             <span className="mono font-bold text-white">{state.lastRedAction || "—"}</span>
             <span className="mono text-muted-foreground text-[10px] uppercase tracking-wider">Compromised nodes</span>
-            <span className="mono font-bold" style={{ color: nodeStats.compromised ? "#ff2a2a" : "#fff" }}>
+            <span className="mono font-bold" style={{ color: nodeStats.compromised ? "#f07832" : "#eadcc8" }}>
               {nodeStats.compromised} / {nodeStats.total || "—"}
             </span>
           </div>
         </div>
-        <div className="card-brutal border-l-[6px]" style={{ borderLeftColor: "#2a7aff" }}>
+        <div className="panel border-l-4" style={{ borderLeftColor: "#79b8ff" }}>
           <div className="section-label mb-3">🔵 BLUE — DEFENDER ({state.bluePolicy})</div>
           <div className="grid grid-cols-[auto_1fr] gap-x-4 gap-y-1.5 text-sm mb-3">
             <span className="mono text-muted-foreground text-[10px] uppercase tracking-wider">Reward</span>
@@ -301,7 +301,7 @@ function SimulationInner() {
       {/* ---------- LIVE NETWORK ---------- */}
       <div className="card-brutal-lg">
         <div className="flex items-center justify-between mb-3">
-          <div className="section-label mb-0">LIVE NETWORK — actual backend state</div>
+          <div className="section-label mb-0">GRAPH SIMULATOR STATE — not Violet Ledger target state</div>
           <div className="mono text-[10px] text-muted-foreground">
             t = {state.network?.step ?? state.step}
           </div>
