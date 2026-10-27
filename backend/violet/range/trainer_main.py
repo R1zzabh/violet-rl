@@ -15,7 +15,7 @@ import sys
 import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, cast
-from uuid import UUID, uuid4
+from uuid import UUID, uuid4, uuid5
 
 import httpx
 import numpy as np
@@ -998,6 +998,43 @@ async def _run_job(client: httpx.AsyncClient, job: dict[str, Any]) -> dict[str, 
     }
 
 
+async def _queue_classroom_evaluation(
+    client: httpx.AsyncClient, training_id: str, result: dict[str, Any]
+) -> str | None:
+    """Queue a separate 40-match frozen evaluation after verified training."""
+    training_run_response = await client.get(f"/range/training-runs/{training_id}")
+    training_run_response.raise_for_status()
+    training_run = training_run_response.json()
+    config = training_run.get("config") or {}
+    if (
+        config.get("scenario_id") != "sqli_lab_v1"
+        or config.get("campaign_label") != "live_demo_v1"
+        or config.get("campaign_revision") != "red_syntax_progress_ppo4_v2"
+        or result.get("training_campaign_complete") is not True
+        or int(result.get("completed_training_episodes", 0)) < 40
+        or not result.get("checkpoint_sha256")
+    ):
+        return None
+    evaluation_id = uuid5(UUID(training_id), "violet-sqli-frozen-evaluation-40-v1")
+    seed = (evaluation_id.int % (2**31 - 100_000)) + 1
+    evaluation_request = {
+        "training_run_id": str(evaluation_id),
+        "checkpoint_run_id": training_id,
+        "role": "joint",
+        "mode": "evaluate",
+        "run_kind": "teaching",
+        "scenario_id": "sqli_lab_v1",
+        "episodes": 40,
+        "max_steps": 40,
+        "seed": seed,
+        "opponent": "none",
+        "campaign_label": "classroom_evaluation_v2",
+    }
+    response = await client.post("/range/training-runs", json=evaluation_request)
+    response.raise_for_status()
+    return str(evaluation_id)
+
+
 async def _stop_requested(client: httpx.AsyncClient, training_id: str) -> bool:
     heartbeat = await client.post(f"/range/training-runs/{training_id}/heartbeat")
     heartbeat.raise_for_status()
@@ -1017,6 +1054,28 @@ async def worker() -> None:
                 response.raise_for_status()
                 job = response.json().get("job")
                 if job is None:
+                    runs_response = await client.get("/range/training-runs?limit=100&offset=0")
+                    runs_response.raise_for_status()
+                    existing_runs = runs_response.json().get("items", [])
+                    existing_run_ids = {
+                        str(item.get("training_run_id")) for item in existing_runs
+                    }
+                    for completed_run in existing_runs:
+                        completed_id = str(completed_run.get("training_run_id", ""))
+                        completed_result = completed_run.get("result") or {}
+                        completed_config = completed_run.get("config") or {}
+                        evaluation_id = str(
+                            uuid5(UUID(completed_id), "violet-sqli-frozen-evaluation-40-v1")
+                        ) if completed_id else ""
+                        if (
+                            completed_run.get("status") == "completed"
+                            and completed_config.get("campaign_revision") == "red_syntax_progress_ppo4_v2"
+                            and completed_result.get("training_campaign_complete") is True
+                            and evaluation_id not in existing_run_ids
+                        ):
+                            await _queue_classroom_evaluation(
+                                client, completed_id, completed_result
+                            )
                     challenge_response = await client.post("/range/sqli/challenges/claim")
                     challenge_response.raise_for_status()
                     challenge_job = challenge_response.json().get("job")
@@ -1056,6 +1115,15 @@ async def worker() -> None:
                         if result.get("research_criteria_met", True)
                         else "failed"
                     )
+                    campaign = job.get("config") or {}
+                    if (
+                        status == "completed"
+                        and campaign.get("campaign_revision") == "red_syntax_progress_ppo4_v2"
+                        and result.get("training_campaign_complete") is True
+                    ):
+                        result["evaluation_run_id"] = str(
+                            uuid5(UUID(training_id), "violet-sqli-frozen-evaluation-40-v1")
+                        )
                 except Exception as exc:
                     result = {"error": type(exc).__name__, "message": str(exc)[:300]}
                     status = "failed"
@@ -1064,6 +1132,8 @@ async def worker() -> None:
                     json={"worker_id": WORKER_ID, "status": status, "result": result},
                 )
                 update_response.raise_for_status()
+                if status == "completed" and result.get("evaluation_run_id"):
+                    await _queue_classroom_evaluation(client, training_id, result)
             except (httpx.HTTPError, OSError):
                 await asyncio.sleep(3.0)
 

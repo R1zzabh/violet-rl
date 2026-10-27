@@ -215,7 +215,7 @@ export default function ChallengePage() {
       <div>
         <div className="eyebrow">Bounded challenge · fixed local executor</div>
         <h1 className="page-title">Can the trained pair find your phrase?</h1>
-        <p className="page-deck">Submit one disposable test phrase. The latest completed Red + Blue checkpoint gets up to 40 rounds against the isolated SQLi target, then the target evidence decides the result.</p>
+        <p className="page-deck">Submit one disposable test phrase. The verified recurrent Red + Blue checkpoint gets up to 32 rounds against the isolated SQLi target, then correlated target evidence decides the result.</p>
       </div>
       <Link href="/" className="button button-secondary"><ArrowLeft size={14} />Training monitor</Link>
     </header>
@@ -247,7 +247,7 @@ export default function ChallengePage() {
           />
           <div className="form-meta"><span>Private in-memory target value</span><span>{phrase.length} / 96</span></div>
           <button className="button button-red" type="submit" disabled={!canStart}>
-            {busy ? <><span className="spinner" />Preparing target</> : <><Swords size={14} />Run 40-round challenge</>}
+            {busy ? <><span className="spinner" />Preparing target</> : <><Swords size={14} />Run 32-round challenge</>}
           </button>
         </form>
 
@@ -259,7 +259,7 @@ export default function ChallengePage() {
         </div>
 
         {!checkpoint && <div className="notice" style={{ marginTop: 16 }}>
-          <strong>No completed demonstration checkpoint yet.</strong> Start the 10,000-episode campaign on the <Link href="/" style={{ color: "var(--blue)", fontWeight: 700 }}>training monitor</Link>; the challenge unlocks when its joint checkpoint completes.
+          <strong>No verified recurrent checkpoint yet.</strong> Start the three-seed campaign on the <Link href="/" style={{ color: "var(--blue)", fontWeight: 700 }}>training monitor</Link>; the challenge unlocks after 50 paired PPO updates per seed.
         </div>}
 
         {challenge && <div className={`challenge-result ${winner === "red" ? "red" : winner === "blue" ? "blue" : challenge.status === "incomplete" || challenge.status === "failed" ? "incomplete" : ""}`}>
@@ -279,7 +279,7 @@ export default function ChallengePage() {
       <div className="form-stack">
         <section className="panel">
           <div className="panel-head">
-            <div><span className="panel-kicker">Red + Blue · up to 40 rounds</span><h2 className="panel-title">Policy and HTTP timeline</h2></div>
+            <div><span className="panel-kicker">Red + Blue · up to 32 rounds</span><h2 className="panel-title">Policy and HTTP timeline</h2></div>
             <span className="pill"><span className={`live-pip ${streamState === "live" ? "" : active ? "is-busy" : ""}`} />{challenge ? streamState : "awaiting session"}</span>
           </div>
           <div className="panel-body"><ChallengeTimeline events={events} /></div>
@@ -304,7 +304,7 @@ export default function ChallengePage() {
       <article className="panel"><div className="panel-head"><div><span className="panel-kicker">Outcome rules</span><h2 className="panel-title">Target evidence decides</h2></div><CircleHelp size={16} className="text-muted" /></div>
         <div className="panel-body form-stack" style={{ gap: 9 }}>
           <div className="panel-inset" style={{ padding: 11 }}><strong style={{ color: "var(--red)", fontSize: 10 }}>Red wins</strong><div className="tiny text-muted" style={{ marginTop: 3 }}>Target evidence confirms the exact session’s phrase was disclosed in an unauthorized response.</div></div>
-          <div className="panel-inset" style={{ padding: 11 }}><strong style={{ color: "var(--blue)", fontSize: 10 }}>Blue wins</strong><div className="tiny text-muted" style={{ marginTop: 3 }}>All 40 rounds finish without disclosure and the owner lookup still works.</div></div>
+          <div className="panel-inset" style={{ padding: 11 }}><strong style={{ color: "var(--blue)", fontSize: 10 }}>Blue wins</strong><div className="tiny text-muted" style={{ marginTop: 3 }}>All 32 rounds finish without disclosure and the owner lookup still works.</div></div>
           <div className="panel-inset" style={{ padding: 11 }}><strong className="text-muted" style={{ fontSize: 10 }}>Incomplete</strong><div className="tiny text-muted" style={{ marginTop: 3 }}>A target or verifier failure produces no win.</div></div>
         </div>
       </article>

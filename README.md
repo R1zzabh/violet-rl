@@ -9,14 +9,15 @@ SQLi learning lab and the preserved Violet Ledger IDOR range.
 | Area | State |
 |---|---|
 | Graph simulator | Existing PettingZoo-style simulator with scripted policies and a custom PPO trainer. Its nodes and actions remain simulated. |
-| SQLi learning lab | A separate HTTP service and database seeded with synthetic records. Red and Blue use independent PPO policies; Red composes bounded query inputs and Blue controls query parameterization, scoped rate limiting, and temporary guest isolation. |
+| SQLi learning lab | A separate HTTP service and database seeded with synthetic records. Red and Blue use separate recurrent PPO actor–critic policies; Red samples bounded request components and Blue selects typed controls. Both update from the same episode’s verified outcomes. |
 | Violet Ledger | Preserved real FastAPI process with synthetic Alice/Bob accounts and documents in its own target database. The existing exercise is authenticated IDOR; historical event replay remains available. |
 | HTTP executor | A separate container accepts typed route, login, document-access, and health actions. Its destination and routes are fixed in code. |
 | Blue controls | Typed reset, ownership-hardening, actor block, and rate-limit commands reach the target through a volume queue. Only ownership hardening is policy-eligible; verification also checks Alice's legitimate read. |
 | VIOLET event storage | Range jobs, full policy samples and transitions, detections, rewards, training lifecycle and hash-linked events are stored in PostgreSQL. Separate Alembic streams manage control and target databases. Run events and episode timelines replay committed records. |
 | Range learning | A dedicated CPU worker holds separate Red and Blue policies fixed within each episode, then updates both with masked categorical PPO at the episode boundary. Teaching runs may be short; research runs require 10,000 completed episodes per training seed. |
 | Evaluation | Frozen candidate and baseline episodes run on paired seeds. Reports include verified attack/prevention, legitimate-read availability, and paired uncertainty. A supported-improvement claim also requires five independent training seeds and the availability criterion. |
-| Dashboard | `/` is the live Red/Blue PPO training monitor; `/challenge` runs the latest completed joint checkpoint against one disposable phrase held in target memory. Legacy pages redirect to `/`. |
+| SQLi reports | `/server` shows target-recorded SQLi request stages; `/episodes` replays saved decisions and PPO diagnostics; `/breaches` links verified SQLi disclosures; `/learning` explains each episode's policy updates and compares checkpoints on matched held-out fixtures; `/experiments` runs matched SQLi exposure branches. |
+| Dashboard | `/` provides a five-update demonstration, a resumable 10,000-update CPU run preset, and the three-seed classroom pilot. These are explicit starts; opening the page does not execute training. |
 
 Each executor sends HTTP requests to exactly one fixed target: the archived
 Ledger executor to Violet Ledger, and the SQLi executor to the SQLi service.
@@ -48,15 +49,29 @@ reachable only from their fixed executors on internal networks. SQLi target
 health is reported by `GET /range/sqli/target/status`; Ledger health remains at
 `GET /range/health`.
 
-Opening `/` starts or reconnects to the single-seed 10,000-episode Red/Blue
-campaign when the private SQLi target is healthy. Each episode saves a joint
-model and optimizer checkpoint. After training, the frozen pair runs 500 new
-seeded matches. The page labels both phases as a classroom demonstration, not a
-multi-seed research claim. `/challenge` accepts one disposable phrase, stores it
-only in API and target process memory during the bounded session, and renders a
-redacted persisted event timeline. Red wins only on correlated target evidence
-of disclosure; Blue wins after 40 rounds when the legitimate lookup still works.
-Target or verifier failures are incomplete outcomes.
+The Training page starts a five-update demonstration, a 10,000-update CPU run, or
+the balanced classroom pilot. New episodes are limited to 32 rounds. The long run
+stores a joint checkpoint after each completed episode; after a graceful stop,
+select its saved checkpoint to continue with another 10,000-update segment. The
+classroom pilot trains three fresh policy pairs for up to 50 updates each and
+evaluates frozen checkpoints on held-out fixtures. The Learning page opens a live
+episode journal, automatically selects an active run, and follows completed
+reports. Each report joins Red and Blue decisions to their own reward components,
+saved advantages and returns, action probabilities before and after PPO on the
+same observations, optimizer diagnostics, checkpoint digests, and the next
+episode's recorded policy versions. Incomplete updates and missing evidence are
+labeled. Reports can be downloaded as Markdown or redacted evidence JSON; viewing
+and exporting issue no target requests. The held-out evaluation section compares
+a run's initial and final checkpoint pair on the same fixtures. The Experiments page
+branches a completed pair into equal-budget runs with different SQLi vulnerable
+configuration frequencies, then evaluates both branches on the same unchanged
+test distribution. These reports make no improvement claim from training loss.
+
+Server Live reads SQLi target-owned traces joined by request and target event IDs.
+It distinguishes target-recorded execution stages from HTTP status and verified
+outcomes. The preserved Violet Ledger still supports its separately verified
+IDOR range, but it is not yet part of the recurrent SQLi policy reports. Permission
+or workflow abuse is not implemented in the current target.
 
 The VIOLET database has its own volume for range run and event records; the
 simulator's existing metrics and checkpoints remain file-backed. Each target

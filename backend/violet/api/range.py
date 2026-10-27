@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import json
 import os
+import random
 import secrets
 from collections import OrderedDict
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 from uuid import UUID, uuid4
@@ -48,6 +51,15 @@ from violet.range.rewards import blue_reward, red_reward
 from violet.range.spool import read_json, write_json_atomic
 from violet.range.verifier import verify_document_access
 from violet.sqli_lab.contracts import (
+    INTERACTION_PROTOCOL_SCHEMA as SQLI_INTERACTION_PROTOCOL_SCHEMA,
+)
+from violet.sqli_lab.contracts import (
+    LEGACY_INTERACTION_PROTOCOL_SCHEMA as SQLI_LEGACY_PROTOCOL_SCHEMA,
+)
+from violet.sqli_lab.contracts import (
+    REWARD_SCHEMA as SQLI_REWARD_SCHEMA,
+)
+from violet.sqli_lab.contracts import (
     SCENARIO_ID as SQLI_SCENARIO_ID,
 )
 from violet.sqli_lab.contracts import (
@@ -80,10 +92,14 @@ _REPOSITORY: EventRepository | None = None
 SQLI_CHALLENGE_SESSIONS: dict[str, dict[str, Any]] = {}
 SQLI_CHALLENGE_LOCK = asyncio.Lock()
 DEMO_CAMPAIGN_LOCK = asyncio.Lock()
+PILOT_LOCK = asyncio.Lock()
+EXPERIMENT_LOCK = asyncio.Lock()
 SQLI_CHALLENGE_MAX_SESSIONS = 16
 SQLI_CHALLENGE_RETENTION_SECONDS = 24 * 60 * 60
 SQLI_CHALLENGE_ACTIVE_TTL_SECONDS = 20 * 60
 SQLI_EVIDENCE_CACHE_SIZE = 2048
+SQLI_EVENT_MAX_BYTES = 48_000
+SQLI_PPO_EVENT_MAX_BYTES = 128_000
 _SQLI_EVIDENCE_CACHE: OrderedDict[str, dict[str, Any]] = OrderedDict()
 
 
@@ -222,7 +238,32 @@ class TrainingRunRequest(BaseModel):
     seed: int = Field(default=17, ge=0, le=2**31 - 1)
     opponent: Literal["scripted", "random", "none"] = "scripted"
     learning_rate: float = Field(default=0.0003, gt=0, le=0.01)
-    campaign_label: Literal["live_demo_v1"] | None = None
+    campaign_label: Literal[
+        "live_demo_v1",
+        "retained_baseline_v1",
+        "classroom_evaluation_v2",
+        "balanced_pilot_v1",
+        "balanced_pilot_evaluation_v1",
+        "learning_evaluation_v1",
+        "exposure_experiment_v1",
+        "exposure_experiment_evaluation_v1",
+    ] | None = None
+    checkpoint_variant: Literal["initial", "final"] = "final"
+    learning_evaluation_id: UUID | None = None
+    learning_evaluation_seeds: list[int] | None = None
+    experiment_id: UUID | None = None
+    experiment_branch: Literal["control", "increased"] | None = None
+    vulnerable_configuration_probability: float | None = Field(default=None, ge=0.0, le=1.0)
+    experiment_episode_seeds: list[int] | None = None
+    experiment_evaluation_matches: int | None = Field(default=None, ge=5, le=100)
+    baseline_training_run_id: UUID | None = None
+    baseline_checkpoint_run_id: UUID | None = None
+    pilot_campaign_id: UUID | None = None
+    pilot_started_at: str | None = None
+    pilot_training_deadline: str | None = None
+    pilot_evaluation_deadline: str | None = None
+    pilot_training_episodes_per_seed: int | None = Field(default=None, ge=1, le=100)
+    pilot_evaluation_seeds: list[int] | None = None
 
     @model_validator(mode="after")
     def require_evaluation_checkpoint(self) -> TrainingRunRequest:
@@ -238,6 +279,77 @@ class TrainingRunRequest(BaseModel):
             raise ValueError("the Violet Ledger episode limit remains 12 decisions")
         if self.scenario_id != SQLI_SCENARIO_ID and self.opponent == "none":
             raise ValueError("the Violet Ledger scenario requires an explicitly labeled comparator")
+        if self.campaign_label is not None and self.scenario_id != SQLI_SCENARIO_ID:
+            raise ValueError("classroom campaign labels are only valid for the SQLi lab")
+        legacy_40_round = self.campaign_label in {
+            "live_demo_v1", "retained_baseline_v1", "classroom_evaluation_v2"
+        }
+        if legacy_40_round and self.max_steps != 40:
+            raise ValueError("archived SQLi classroom campaigns retain their 40-round limit")
+        if self.campaign_label in {"balanced_pilot_v1", "balanced_pilot_evaluation_v1"} and self.max_steps != 32:
+            raise ValueError("new SQLi policy runs use a maximum of 32 rounds per episode")
+        if self.campaign_label in {
+            "learning_evaluation_v1", "exposure_experiment_v1", "exposure_experiment_evaluation_v1"
+        } and self.max_steps > 32:
+            raise ValueError("new SQLi policy runs use a maximum of 32 rounds per episode")
+        if self.scenario_id == SQLI_SCENARIO_ID and not legacy_40_round and self.max_steps > 32:
+            raise ValueError("new SQLi runs use a maximum of 32 rounds per episode")
+        if self.campaign_label in {"live_demo_v1", "retained_baseline_v1", "classroom_evaluation_v2"} and self.episodes != 40:
+            raise ValueError("legacy SQLi classroom campaigns use exactly 40 requested episodes")
+        if self.campaign_label == "balanced_pilot_v1" and (
+            self.mode != "train" or self.episodes != 50 or self.seed not in {17, 18, 19}
+        ):
+            raise ValueError("balanced pilot training uses 50 episodes on seeds 17, 18, and 19")
+        if self.campaign_label == "balanced_pilot_evaluation_v1" and (
+            self.mode != "evaluate" or self.episodes != 15 or self.pilot_campaign_id is None
+        ):
+            raise ValueError("balanced pilot evaluation uses 15 held-out matches per campaign seed")
+        if self.campaign_label == "classroom_evaluation_v2" and self.mode != "evaluate":
+            raise ValueError("the frozen classroom evaluation must use a checkpoint")
+        if self.campaign_label == "retained_baseline_v1" and self.mode != "train":
+            raise ValueError("the retained baseline continuation must train from its checkpoint")
+        if self.campaign_label == "balanced_pilot_v1" and self.checkpoint_run_id is not None:
+            raise ValueError("balanced pilot policies must start from fresh initialization")
+        if self.campaign_label == "balanced_pilot_evaluation_v1" and (
+            self.pilot_evaluation_seeds is None
+            or len(self.pilot_evaluation_seeds) != self.episodes
+            or len(set(self.pilot_evaluation_seeds)) != self.episodes
+        ):
+            raise ValueError("balanced pilot evaluation requires 15 unique held-out seeds")
+        if self.campaign_label == "learning_evaluation_v1" and (
+            self.mode != "evaluate"
+            or self.checkpoint_run_id is None
+            or self.learning_evaluation_id is None
+            or self.learning_evaluation_seeds is None
+            or len(self.learning_evaluation_seeds) != self.episodes
+            or len(set(self.learning_evaluation_seeds)) != self.episodes
+        ):
+            raise ValueError("learning checkpoint evaluation requires a paired seed schedule")
+        if self.campaign_label == "exposure_experiment_v1" and (
+            self.mode != "train"
+            or self.checkpoint_run_id is None
+            or self.experiment_id is None
+            or self.experiment_branch is None
+            or self.vulnerable_configuration_probability is None
+            or self.experiment_episode_seeds is None
+            or len(self.experiment_episode_seeds) != self.episodes
+            or len(set(self.experiment_episode_seeds)) != self.episodes
+            or self.experiment_evaluation_matches is None
+        ):
+            raise ValueError("exposure experiment branches require equal seeded training budgets")
+        if self.campaign_label == "exposure_experiment_evaluation_v1" and (
+            self.mode != "evaluate"
+            or self.checkpoint_run_id is None
+            or self.experiment_id is None
+            or self.experiment_branch is None
+            or self.experiment_episode_seeds is None
+            or len(self.experiment_episode_seeds) != self.episodes
+        ):
+            raise ValueError("exposure experiment evaluation requires the matched test schedule")
+        if self.campaign_label in {"balanced_pilot_v1", "balanced_pilot_evaluation_v1"} and (
+            self.pilot_campaign_id is None
+        ):
+            raise ValueError("balanced pilot runs require a campaign ID")
         if self.mode == "evaluate" and self.checkpoint_run_id is None:
             raise ValueError("evaluation requires a completed compatible checkpoint run ID")
         if self.run_kind == "research" and self.mode == "train" and self.episodes < 10000:
@@ -245,6 +357,33 @@ class TrainingRunRequest(BaseModel):
         if self.run_kind == "research" and self.mode == "evaluate" and self.episodes < 100:
             raise ValueError("research evaluation requires at least 100 paired held-out episodes")
         return self
+
+
+class PilotStartRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+
+class LearningReportStartRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    training_run_id: UUID
+    evaluation_id: UUID
+    matches: int = Field(default=20, ge=5, le=100)
+
+
+class ExposureExperimentStartRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    source_training_run_id: UUID
+    experiment_id: UUID
+    episodes_per_branch: int = Field(default=30, ge=5, le=500)
+    seed: int = Field(default=1701, ge=0, le=2**31 - 1)
+    control_vulnerability_probability: float = Field(default=0.35, ge=0.0, le=1.0)
+    increased_vulnerability_probability: float = Field(default=0.85, ge=0.0, le=1.0)
+    evaluation_matches: int = Field(default=20, ge=5, le=100)
+
+
+class ExposureExperimentEvaluationRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    evaluation_matches: int = Field(default=20, ge=5, le=100)
 
 
 class WorkerUpdate(BaseModel):
@@ -292,8 +431,17 @@ class SqliEventSubmission(BaseModel):
 
     @model_validator(mode="after")
     def payload_is_bounded(self) -> SqliEventSubmission:
-        if len(json.dumps(self.payload, separators=(",", ":"))) > 48_000:
-            raise ValueError("event payload exceeds the 48 KB lab event limit")
+        payload_bytes = len(
+            json.dumps(self.payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+        )
+        limit = (
+            SQLI_PPO_EVENT_MAX_BYTES
+            if self.event_type == "sqli_ppo_update"
+            else SQLI_EVENT_MAX_BYTES
+        )
+        if payload_bytes > limit:
+            limit_kb = limit // 1000
+            raise ValueError(f"event payload exceeds the {limit_kb} KB lab event limit")
         return self
 
 
@@ -314,6 +462,8 @@ class SqliControlRequest(BaseModel):
     episode_id: UUID
     decision_id: UUID | None = None
     action: Literal["RESET", "PARAMETERIZE_QUERY", "RATE_LIMIT_GUEST", "ISOLATE_GUEST_LOOKUP"]
+    vulnerable_configuration_probability: float = Field(default=1.0, ge=0.0, le=1.0)
+    fixture_seed: int | None = Field(default=None, ge=0, le=2**31 - 1)
 
 
 class SqliChallengeRequest(BaseModel):
@@ -471,10 +621,46 @@ def _sqli_telemetry(result: SqliExecutorResult) -> dict[str, object]:
         "challenge_id",
         "challenge_disclosed",
         "controls",
+        "purpose",
+        "trace_schema_id",
+        "trace",
     )
     return {
         "evidence_status": "verified",
         **{key: item[key] for key in allowed if key in item},
+    }
+
+
+@router.get("/server/traces/{target_event_id}")
+async def get_server_trace(target_event_id: UUID) -> dict[str, Any]:
+    """Return one target-owned request trace from the read-only evidence spool."""
+    path = SQLI_TARGET_EVIDENCE
+    if path.is_dir() or not path.suffix:
+        path = path / "events.jsonl"
+    evidence = _find_sqli_target_event(path, str(target_event_id))
+    if evidence is None:
+        raise HTTPException(status_code=404, detail="server trace evidence was not found")
+    trace = evidence.get("trace")
+    if not isinstance(trace, list):
+        raise HTTPException(status_code=404, detail="server trace stages were not recorded")
+    return {
+        "schema_id": evidence.get("trace_schema_id", "violet.server_trace.v1"),
+        "target_event_id": evidence.get("target_event_id"),
+        "run_id": evidence.get("run_id"),
+        "episode_id": evidence.get("episode_id"),
+        "decision_id": evidence.get("decision_id"),
+        "request_id": evidence.get("request_id"),
+        "purpose": evidence.get("purpose", "unspecified"),
+        "route_id": evidence.get("route_id"),
+        "method": evidence.get("method"),
+        "http_status": evidence.get("http_status"),
+        "occurred_at": evidence.get("occurred_at"),
+        "duration_ms": evidence.get("duration_ms"),
+        "trace": trace,
+        "evidence": {
+            "evidence_status": "target_recorded",
+            "target_version": SQLI_TARGET_VERSION,
+        },
     }
 
 
@@ -814,10 +1000,40 @@ async def stream_run_events(
 
 
 @router.get("/runs/{run_id}/episodes")
-async def get_run_episodes(run_id: UUID, limit: int = 100) -> dict[str, Any]:
-    if not 1 <= limit <= 500:
-        raise HTTPException(status_code=422, detail="limit must be between 1 and 500")
-    return {"run_id": str(run_id), "items": _repository().list_episodes(str(run_id), limit)}
+async def get_run_episodes(
+    run_id: UUID,
+    after_index: int | None = None,
+    before_index: int | None = None,
+    limit: int = 100,
+) -> dict[str, Any]:
+    if (
+        (after_index is not None and after_index < -1)
+        or (before_index is not None and before_index < 0)
+        or (after_index is not None and before_index is not None)
+        or not 1 <= limit <= 500
+    ):
+        raise HTTPException(status_code=422, detail="invalid episode cursor or limit")
+    page = _repository().list_episodes(
+        str(run_id),
+        limit + 1,
+        after_index=after_index,
+        before_index=before_index,
+    )
+    items = page[:limit] if after_index is not None else page[-limit:]
+    has_more = len(page) > limit
+    older = has_more if after_index is None else True
+    newer = has_more if after_index is not None else before_index is not None
+    return {
+        "run_id": str(run_id),
+        "after_index": after_index,
+        "before_index": before_index,
+        "next_after_index": items[-1]["episode_index"] if items else after_index,
+        "next_before_index": items[0]["episode_index"] if items else before_index,
+        "has_more": has_more,
+        "has_older": older,
+        "has_newer": newer,
+        "items": items,
+    }
 
 
 @router.get("/runs/{run_id}/episodes/{episode_id}/timeline")
@@ -832,14 +1048,16 @@ async def get_episode_timeline(
     repository = _repository()
     if not repository.episode_exists(str(run_id), str(episode_id)):
         raise HTTPException(status_code=404, detail="range episode not found")
-    items = repository.episode_events_page(
-        str(run_id), str(episode_id), after_seq=after_seq, limit=limit
+    page = repository.episode_events_page(
+        str(run_id), str(episode_id), after_seq=after_seq, limit=limit + 1
     )
+    items = page[:limit]
     return {
         "run_id": str(run_id),
         "episode_id": str(episode_id),
         "after_seq": after_seq,
         "next_after_seq": items[-1]["seq"] if items else after_seq,
+        "has_more": len(page) > limit,
         "items": items,
     }
 
@@ -854,28 +1072,168 @@ async def get_sqli_run_summary(
     run = repository.get_run(str(run_id))
     if run is None or run.get("target_version") != SQLI_TARGET_VERSION:
         raise HTTPException(status_code=404, detail="SQLi lab run not found")
-    items = repository.lab_summary_events(str(run_id), after_seq, limit)
+    page = repository.lab_summary_events(str(run_id), after_seq, limit + 1)
+    items = page[:limit]
     return {
         "run_id": str(run_id),
         "after_seq": after_seq,
         "next_after_seq": items[-1]["seq"] if items else after_seq,
+        "has_more": len(page) > limit,
         "items": items,
+    }
+
+
+def _checkpoint_record_metadata(
+    record: dict[str, Any], *, allow_running: bool = False
+) -> dict[str, Any] | None:
+    """Check persisted checkpoint identity and policy-version metadata.
+
+    The trainer verifies artifact bytes before loading them. This API-side
+    check makes sure the run has a digest and its policy versions agree with
+    the latest accepted Red and Blue update records.
+    """
+    config = record.get("config") or {}
+    result = record.get("result") or {}
+    status = record.get("status")
+    statuses = {"completed", "stopped", "running"} if allow_running else {"completed", "stopped"}
+    if status not in statuses:
+        return None
+    if (
+        record.get("role") != "joint"
+        or config.get("scenario_id") != SQLI_SCENARIO_ID
+        or config.get("target_version") != SQLI_TARGET_VERSION
+        or config.get("reward_schema_id") not in {"sqli.reward.v1", "sqli.reward.v2", SQLI_REWARD_SCHEMA}
+    ):
+        return None
+
+    updates = _repository().training_updates(str(record.get("training_run_id")))
+    by_role = {role: [item for item in updates if item.get("role") == role] for role in ("red", "blue")}
+    if not by_role["red"] or not by_role["blue"]:
+        return None
+
+    saved_versions = result.get("policy_versions")
+    if not isinstance(saved_versions, dict):
+        saved_versions = {}
+    metadata = result.get("checkpoint_metadata")
+    protocol_schema_id = config.get(
+        "interaction_protocol_schema_id",
+        metadata.get("interaction_protocol_schema_id", SQLI_LEGACY_PROTOCOL_SCHEMA)
+        if isinstance(metadata, dict)
+        else SQLI_LEGACY_PROTOCOL_SCHEMA,
+    )
+    ppo_provenance = result.get("ppo_settings")
+    if isinstance(metadata, dict):
+        if (
+            metadata.get("schema_id") not in {"sqli.checkpoint_metadata.v1", "sqli.checkpoint_metadata.v2", "sqli.checkpoint_metadata.v3"}
+            or metadata.get("training_run_id") != record.get("training_run_id")
+            or metadata.get("reward_schema_id") != config.get("reward_schema_id")
+            or metadata.get("target_version") != SQLI_TARGET_VERSION
+            or metadata.get("optimization_passes") != 4
+            or (
+                metadata.get("schema_id") in {"sqli.checkpoint_metadata.v2", "sqli.checkpoint_metadata.v3"}
+                and metadata.get("interaction_protocol_schema_id") != protocol_schema_id
+            )
+            or (
+                metadata.get("schema_id") == "sqli.checkpoint_metadata.v3"
+                and (
+                    metadata.get("model_architecture") != "factorized_gru_actor_critic.v1"
+                    or ppo_provenance is None
+                    or ppo_provenance.get("actor_critic") != "factorized_gru_actor_critic"
+                )
+            )
+        ):
+            return None
+        metadata_provenance = metadata.get("ppo_settings")
+        if metadata_provenance is not None:
+            if (
+                not isinstance(metadata_provenance, dict)
+                or metadata_provenance.get("optimization_passes") != 4
+                or (ppo_provenance is not None and metadata_provenance != ppo_provenance)
+            ):
+                return None
+            ppo_provenance = metadata_provenance
+        recorded_updates = result.get("completed_training_episodes")
+        metadata_updates = metadata.get("completed_training_updates")
+        if (
+            not isinstance(metadata_updates, int)
+            or metadata_updates < 0
+            or (isinstance(recorded_updates, int) and recorded_updates != metadata_updates)
+            or metadata.get("campaign_revision") != config.get("campaign_revision")
+        ):
+            return None
+        saved_versions = metadata.get("policy_versions") or saved_versions
+
+    policy_versions: dict[str, int] = {}
+    latest_digests: dict[str, str] = {}
+    for role in ("red", "blue"):
+        latest = max(
+            by_role[role],
+            key=lambda item: (item.get("update_index", 0), item.get("created_at", "")),
+        )
+        metrics = latest.get("metrics") or {}
+        version = metrics.get("policy_version_after")
+        if not isinstance(version, (int, float)) or int(version) < 1:
+            return None
+        if saved_versions and int(saved_versions.get(role, -1)) != int(version):
+            return None
+        policy_versions[role] = int(version)
+        digest = latest.get("checkpoint_sha256")
+        if isinstance(digest, str) and len(digest) == 64:
+            latest_digests[role] = digest
+
+    if saved_versions and any(role not in saved_versions for role in ("red", "blue")):
+        return None
+    digest = result.get("checkpoint_sha256")
+    if not isinstance(digest, str) or len(digest) != 64:
+        if not allow_running:
+            return None
+        if len(latest_digests) != 2 or latest_digests["red"] != latest_digests["blue"]:
+            return None
+        digest = latest_digests["red"]
+    elif status in {"running", "completed"} and (
+        latest_digests.get("red") != digest or latest_digests.get("blue") != digest
+    ):
+        return None
+    if isinstance(metadata, dict) and metadata.get("checkpoint_sha256") not in {None, digest}:
+        return None
+
+    completed_updates = result.get("completed_training_episodes")
+    if isinstance(metadata, dict):
+        completed_updates = metadata.get("completed_training_updates", completed_updates)
+    if not isinstance(completed_updates, int):
+        completed_updates = min(
+            len({item.get("update_index") for item in by_role[role] if item.get("update_index")})
+            for role in ("red", "blue")
+        )
+    if completed_updates < 1:
+        return None
+    if isinstance(metadata, dict) and completed_updates != metadata.get("completed_training_updates"):
+        return None
+    return {
+        "training_run_id": record["training_run_id"],
+        "status": status,
+        "checkpoint_sha256": digest,
+        "completed_training_episodes": completed_updates,
+        "policy_versions": policy_versions,
+        "reward_schema_id": config["reward_schema_id"],
+        "interaction_protocol_schema_id": protocol_schema_id,
+        "target_version": SQLI_TARGET_VERSION,
+        "checkpoint_metadata": metadata,
+        "ppo_settings": ppo_provenance if isinstance(ppo_provenance, dict) else None,
     }
 
 
 @router.post("/training-runs", status_code=202)
 async def create_training_run(request: TrainingRunRequest) -> dict[str, Any]:
+    checkpoint_metadata: dict[str, Any] | None = None
+    source_checkpoint_digest: str | None = None
+    source_checkpoint_versions: dict[str, int] | None = None
     if request.mode == "evaluate" and request.checkpoint_run_id is not None:
         source = _repository().get_training_run(str(request.checkpoint_run_id))
-        if (
-            source is None
-            or source["status"] != "completed"
-            or source["role"] != request.role
-            or not (source.get("result") or {}).get("checkpoint_sha256")
-        ):
+        if source is None or source.get("role") != request.role:
             raise HTTPException(
                 status_code=422,
-                detail="evaluation checkpoint must belong to a completed run for the same role",
+                detail="evaluation checkpoint must belong to a compatible run for the same role",
             )
         source_result = source.get("result") or {} if source else {}
         source_config = source.get("config") or {} if source else {}
@@ -883,6 +1241,45 @@ async def create_training_run(request: TrainingRunRequest) -> dict[str, Any]:
             raise HTTPException(
                 status_code=422,
                 detail="evaluation checkpoint belongs to an incompatible target scenario",
+            )
+        if request.scenario_id == SQLI_SCENARIO_ID:
+            checkpoint_metadata = _checkpoint_record_metadata(source)
+            if checkpoint_metadata is None:
+                raise HTTPException(
+                    status_code=422,
+                    detail="evaluation checkpoint digest and policy metadata could not be verified",
+                )
+            if checkpoint_metadata["interaction_protocol_schema_id"] != SQLI_INTERACTION_PROTOCOL_SCHEMA:
+                raise HTTPException(
+                    status_code=422,
+                    detail="evaluation requires a checkpoint trained with the current Blue-control-first protocol",
+                )
+            if request.checkpoint_variant == "initial":
+                if request.campaign_label != "learning_evaluation_v1":
+                    raise HTTPException(status_code=422, detail="initial checkpoint evaluation is reserved for learning reports")
+                initial_digest = source_result.get("initial_checkpoint_sha256")
+                initial_versions = source_result.get("initial_policy_versions")
+                if (
+                    not isinstance(initial_digest, str)
+                    or len(initial_digest) != 64
+                    or not isinstance(initial_versions, dict)
+                    or any(not isinstance(initial_versions.get(role), int) for role in ("red", "blue"))
+                ):
+                    raise HTTPException(status_code=422, detail="the source run has no verifiable initial checkpoint")
+                source_checkpoint_digest = initial_digest
+                source_checkpoint_versions = {
+                    role: int(initial_versions[role]) for role in ("red", "blue")
+                }
+            else:
+                source_checkpoint_digest = checkpoint_metadata["checkpoint_sha256"]
+                source_checkpoint_versions = checkpoint_metadata["policy_versions"]
+        elif (
+            source.get("status") != "completed"
+            or not (source_result.get("checkpoint_sha256") or "")
+        ):
+            raise HTTPException(
+                status_code=422,
+                detail="evaluation checkpoint must come from a completed training run",
             )
         if request.run_kind == "research" and (
             source_config.get("run_kind") != "research"
@@ -892,8 +1289,71 @@ async def create_training_run(request: TrainingRunRequest) -> dict[str, Any]:
                 status_code=422,
                 detail="research evaluation requires a research checkpoint with 10,000 completed training episodes",
             )
+        if request.campaign_label == "classroom_evaluation_v2" and (
+            source_config.get("campaign_revision") != "red_syntax_progress_ppo4_v2"
+            or checkpoint_metadata is None
+            or checkpoint_metadata["reward_schema_id"] != "sqli.reward.v2"
+            or checkpoint_metadata["completed_training_episodes"] < 40
+        ):
+            raise HTTPException(
+                status_code=422,
+                detail="classroom evaluation requires the verified 40-update revised checkpoint",
+            )
+        if request.campaign_label == "balanced_pilot_evaluation_v1" and (
+            source_config.get("campaign_label") != "balanced_pilot_v1"
+            or source_config.get("pilot_campaign_id") != str(request.pilot_campaign_id)
+            or checkpoint_metadata is None
+            or checkpoint_metadata["reward_schema_id"] != SQLI_REWARD_SCHEMA
+            or checkpoint_metadata["completed_training_episodes"] < 1
+        ):
+            raise HTTPException(
+                status_code=422,
+                detail="pilot evaluation requires a verified fresh checkpoint from the same campaign",
+            )
+    elif request.mode == "train" and request.scenario_id == SQLI_SCENARIO_ID and request.checkpoint_run_id:
+        source = _repository().get_training_run(str(request.checkpoint_run_id))
+        if source is None:
+            raise HTTPException(status_code=422, detail="training continuation checkpoint was not found")
+        checkpoint_metadata = _checkpoint_record_metadata(source)
+        if checkpoint_metadata is None:
+            raise HTTPException(
+                status_code=422,
+                detail="training continuation checkpoint digest and policy metadata could not be verified",
+            )
+        source_checkpoint_digest = checkpoint_metadata["checkpoint_sha256"]
+        source_checkpoint_versions = checkpoint_metadata["policy_versions"]
+        if (source.get("config") or {}).get("scenario_id") != SQLI_SCENARIO_ID:
+            raise HTTPException(status_code=422, detail="training checkpoint belongs to an incompatible target")
+        if checkpoint_metadata["interaction_protocol_schema_id"] != SQLI_INTERACTION_PROTOCOL_SCHEMA:
+            raise HTTPException(status_code=422, detail="training cannot continue a Red-first checkpoint")
+        if request.campaign_label == "retained_baseline_v1":
+            if checkpoint_metadata["reward_schema_id"] != "sqli.reward.v1":
+                raise HTTPException(status_code=422, detail="retained baseline continuation requires the v1 reward checkpoint")
+        elif checkpoint_metadata["reward_schema_id"] not in {
+            "sqli.reward.v1", "sqli.reward.v2", SQLI_REWARD_SCHEMA
+        }:
+            raise HTTPException(status_code=422, detail="training checkpoint reward contract is incompatible")
     training_run_id = str(request.training_run_id or uuid4())
     sqli = request.scenario_id == SQLI_SCENARIO_ID
+    campaign_revision = {
+        "live_demo_v1": "red_syntax_progress_ppo4_v2",
+        "retained_baseline_v1": "retained_baseline_reward_v1_ppo4",
+        "classroom_evaluation_v2": "frozen_evaluation_40_v1",
+        "balanced_pilot_v1": "balanced_adversarial_gru_ppo4_v4",
+        "balanced_pilot_evaluation_v1": "balanced_adversarial_eval_v1",
+        "learning_evaluation_v1": "frozen_checkpoint_comparison_gru_v1",
+        "exposure_experiment_v1": "exposure_adaptation_gru_v1",
+        "exposure_experiment_evaluation_v1": "exposure_held_out_gru_v1",
+    }.get(request.campaign_label or "")
+    reward_schema_id = (
+        "sqli.reward.v1"
+        if sqli and request.campaign_label == "retained_baseline_v1"
+        else "sqli.reward.v2"
+        if sqli and request.campaign_label in {"live_demo_v1", "classroom_evaluation_v2"}
+        else SQLI_REWARD_SCHEMA
+        if sqli
+        else "violet.range.reward.v2"
+    )
     config = {
         "episodes": request.episodes,
         "run_kind": request.run_kind,
@@ -903,7 +1363,36 @@ async def create_training_run(request: TrainingRunRequest) -> dict[str, Any]:
         "opponent": "none" if sqli else request.opponent,
         "learning_rate": request.learning_rate,
         "campaign_label": request.campaign_label,
+        "campaign_revision": campaign_revision,
+        "interaction_protocol_schema_id": SQLI_INTERACTION_PROTOCOL_SCHEMA if sqli else None,
+        "pilot_campaign_id": str(request.pilot_campaign_id) if request.pilot_campaign_id else None,
+        "pilot_started_at": request.pilot_started_at,
+        "pilot_training_deadline": request.pilot_training_deadline,
+        "pilot_evaluation_deadline": request.pilot_evaluation_deadline,
+        "pilot_training_episodes_per_seed": request.pilot_training_episodes_per_seed,
+        "pilot_training_seed_schedule": (
+            [(request.seed + index) % (2**31 - 1) for index in range(request.episodes)]
+            if request.campaign_label == "balanced_pilot_v1"
+            else None
+        ),
+        "pilot_evaluation_seeds": request.pilot_evaluation_seeds,
+        "checkpoint_variant": request.checkpoint_variant,
+        "learning_evaluation_id": str(request.learning_evaluation_id) if request.learning_evaluation_id else None,
+        "learning_evaluation_seeds": request.learning_evaluation_seeds,
+        "experiment_id": str(request.experiment_id) if request.experiment_id else None,
+        "experiment_branch": request.experiment_branch,
+        "vulnerable_configuration_probability": request.vulnerable_configuration_probability,
+        "experiment_episode_seeds": request.experiment_episode_seeds,
+        "experiment_evaluation_matches": request.experiment_evaluation_matches,
         "checkpoint_run_id": str(request.checkpoint_run_id) if request.checkpoint_run_id else None,
+        "baseline_training_run_id": (
+            str(request.baseline_training_run_id) if request.baseline_training_run_id else None
+        ),
+        "baseline_checkpoint_run_id": (
+            str(request.baseline_checkpoint_run_id) if request.baseline_checkpoint_run_id else None
+        ),
+        "source_checkpoint_sha256": source_checkpoint_digest,
+        "source_policy_versions": source_checkpoint_versions,
         "target_version": SQLI_TARGET_VERSION if sqli else "violet_ledger_v1",
         "observation_schema_ids": (
             {role: f"{role}.sqli.range_observation.v1" for role in ("red", "blue")}
@@ -928,7 +1417,7 @@ async def create_training_run(request: TrainingRunRequest) -> dict[str, Any]:
         ),
         "observation_schema_id": "sqli.range_observation.v1" if sqli else None,
         "action_schema_id": "sqli.composed_action.v1" if sqli else None,
-        "reward_schema_id": "sqli.reward.v1" if sqli else "violet.range.reward.v2",
+        "reward_schema_id": reward_schema_id,
         "algorithm": ("factorized_red_categorical_ppo" if sqli else "masked_categorical_ppo")
         if request.mode == "train"
         else "policy_evaluation",
@@ -941,89 +1430,118 @@ async def create_training_run(request: TrainingRunRequest) -> dict[str, Any]:
         raise HTTPException(status_code=409, detail=str(exc)) from None
 
 
-@router.post("/sqli/demo-campaign", status_code=202)
+@router.post("/sqli/demo-campaign", status_code=410)
 async def start_demo_campaign(restart: bool = False) -> dict[str, Any]:
-    """Create or return the single-seed, 10,000-episode classroom campaign."""
-    async with DEMO_CAMPAIGN_LOCK:
-        campaigns = [
-            item
-            for item in _repository().list_training_runs(100)
-            if item.get("config", {}).get("campaign_label") == "live_demo_v1"
-            and item.get("config", {}).get("scenario_id") == SQLI_SCENARIO_ID
-        ]
-        latest = campaigns[0] if campaigns else None
-        if latest and latest["status"] in {"queued", "running"}:
-            return latest
-        if latest and latest["status"] == "completed" and not restart:
-            return latest
-        if latest and latest["status"] not in {"failed", "stopped", "completed"}:
-            return latest
-        if latest and latest["status"] in {"failed", "stopped"} and not restart:
-            return latest
+    """Retire the page-load demo in favor of an explicitly started pilot."""
+    del restart
+    raise HTTPException(
+        status_code=410,
+        detail="The single-seed demo is retired. Start an explicit three-seed pilot at /sqli/pilots.",
+    )
 
-        health_path = SQLI_SPOOL / "health.json"
-        if not health_path.exists():
-            raise HTTPException(status_code=503, detail="the isolated SQLi target is unavailable")
-        try:
-            health = read_json(health_path)
-            updated = datetime.fromisoformat(str(health["updated_at"]))
-            target = health.get("target") or {}
-            available = (
-                (datetime.now(UTC) - updated.astimezone(UTC)).total_seconds() <= 15
-                and isinstance(target, dict)
-                and target.get("status") == "available"
+
+def _is_sqli_campaign(record: dict[str, Any], label: str) -> bool:
+    config = record.get("config") or {}
+    return config.get("campaign_label") == label and config.get("scenario_id") == SQLI_SCENARIO_ID
+
+
+def _retained_campaign_baseline(all_runs: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """Resolve the original v1 checkpoint even after continuation restarts."""
+    by_id = {str(item.get("training_run_id")): item for item in all_runs}
+    for item in all_runs:
+        config = item.get("config") or {}
+        linked_id = config.get("baseline_checkpoint_run_id") or config.get("baseline_training_run_id")
+        linked = by_id.get(str(linked_id)) if linked_id else None
+        if (
+            linked
+            and (linked.get("config") or {}).get("reward_schema_id") == "sqli.reward.v1"
+            and _checkpoint_record_metadata(linked) is not None
+        ):
+            return linked
+    return next(
+        (
+            item
+            for item in all_runs
+            if item.get("status") in {"stopped", "completed"}
+            and (item.get("config") or {}).get("scenario_id") == SQLI_SCENARIO_ID
+            and (item.get("config") or {}).get("reward_schema_id") == "sqli.reward.v1"
+            and _checkpoint_record_metadata(item) is not None
+        ),
+        None,
+    )
+
+
+def _latest_available_sqli_checkpoint() -> dict[str, Any] | None:
+    for item in _all_training_runs():
+        config = item.get("config") or {}
+        if (
+            config.get("campaign_label") != "balanced_pilot_v1"
+            or config.get("campaign_revision") not in {"balanced_adversarial_ppo4_v3", "balanced_adversarial_gru_ppo4_v4"}
+            or config.get("scenario_id") != SQLI_SCENARIO_ID
+            or config.get("episodes") != 50
+            or config.get("interaction_protocol_schema_id") != SQLI_INTERACTION_PROTOCOL_SCHEMA
+            or item.get("mode") != "train"
+        ):
+            continue
+        checkpoint = _checkpoint_record_metadata(item, allow_running=True)
+        if (
+            checkpoint is None
+            or checkpoint["reward_schema_id"] != SQLI_REWARD_SCHEMA
+            or checkpoint["interaction_protocol_schema_id"] != SQLI_INTERACTION_PROTOCOL_SCHEMA
+            or checkpoint["completed_training_episodes"] < 50
+        ):
+            continue
+        updates = _repository().training_updates(str(item["training_run_id"]))
+        role_indices = {
+            role: {
+                int(update["update_index"])
+                for update in updates
+                if update.get("role") == role and isinstance(update.get("update_index"), int)
+            }
+            for role in ("red", "blue")
+        }
+        if any(not set(range(1, 51)).issubset(role_indices[role]) for role in ("red", "blue")):
+            continue
+        final_rows = {
+            role: next(
+                update
+                for update in reversed(updates)
+                if update.get("role") == role and update.get("update_index") == 50
             )
-        except (OSError, KeyError, TypeError, ValueError):
-            available = False
-        if not available:
-            raise HTTPException(status_code=503, detail="the isolated SQLi target is unavailable")
-        return await create_training_run(
-            TrainingRunRequest(
-                role="joint",
-                mode="train",
-                run_kind="research",
-                scenario_id="sqli_lab_v1",
-                episodes=10000,
-                max_steps=40,
-                seed=secrets.randbelow(2**31 - 100_000),
-                opponent="none",
-                campaign_label="live_demo_v1",
-            )
-        )
+            for role in ("red", "blue")
+        }
+        if any(
+            final_rows[role].get("checkpoint_sha256") != checkpoint["checkpoint_sha256"]
+            or int((final_rows[role].get("metrics") or {}).get("optimizer_steps", 0)) != 4
+            for role in ("red", "blue")
+        ):
+            continue
+        return {**item, "checkpoint_metadata": checkpoint}
+    return None
 
 
 def _latest_completed_sqli_checkpoint() -> dict[str, Any] | None:
-    candidates = [
-        item
-        for item in _repository().list_training_runs(100)
-        if item.get("status") == "completed"
-        and item.get("role") == "joint"
-        and item.get("mode") == "train"
-        and item.get("config", {}).get("scenario_id") == SQLI_SCENARIO_ID
-        and item.get("config", {}).get("run_kind") == "research"
-        and int((item.get("result") or {}).get("completed_training_episodes", 0)) >= 10000
-        and (item.get("result") or {}).get("checkpoint_sha256")
-    ]
-    return candidates[0] if candidates else None
+    """Compatibility alias for callers that used the old completed-run name."""
+    return _latest_available_sqli_checkpoint()
 
 
 @router.get("/sqli/checkpoint")
 async def latest_sqli_checkpoint() -> dict[str, Any] | None:
     """Return compact checkpoint metadata without the campaign's episode array."""
-    checkpoint = _latest_completed_sqli_checkpoint()
+    checkpoint = _latest_available_sqli_checkpoint()
     if checkpoint is None:
         return None
-    result = checkpoint.get("result") or {}
     return {
         "training_run_id": checkpoint["training_run_id"],
         "status": checkpoint["status"],
         "created_at": checkpoint.get("created_at"),
         "config": checkpoint.get("config") or {},
         "result": {
-            "completed_training_episodes": result.get("completed_training_episodes"),
-            "valid_ppo_updated_episodes": result.get("valid_ppo_updated_episodes"),
-            "checkpoint_sha256": result.get("checkpoint_sha256"),
-            "policy_versions": result.get("policy_versions"),
+            "completed_training_episodes": (checkpoint.get("checkpoint_metadata") or {}).get("completed_training_episodes"),
+            "valid_ppo_updated_episodes": (checkpoint.get("checkpoint_metadata") or {}).get("completed_training_episodes"),
+            "checkpoint_sha256": (checkpoint.get("checkpoint_metadata") or {}).get("checkpoint_sha256"),
+            "policy_versions": (checkpoint.get("checkpoint_metadata") or {}).get("policy_versions"),
+            "checkpoint_metadata": (checkpoint.get("checkpoint_metadata") or {}).get("checkpoint_metadata"),
         },
     }
 
@@ -1046,7 +1564,7 @@ async def create_sqli_challenge(challenge: SqliChallengeRequest) -> dict[str, An
     if checkpoint is None:
         raise HTTPException(
             status_code=409,
-            detail="complete the 10,000-episode demonstration campaign before starting a challenge",
+            detail="complete 50 verified balanced-pilot updates before starting a challenge",
         )
     health_path = SQLI_SPOOL / "health.json"
     if not health_path.exists():
@@ -1070,8 +1588,11 @@ async def create_sqli_challenge(challenge: SqliChallengeRequest) -> dict[str, An
         "run_id": str(challenge_id),
         "episode_id": str(uuid4()),
         "training_run_id": checkpoint["training_run_id"],
+        "checkpoint_sha256": checkpoint["checkpoint_metadata"]["checkpoint_sha256"],
+        "checkpoint_policy_versions": checkpoint["checkpoint_metadata"]["policy_versions"],
+        "checkpoint_metadata": checkpoint["checkpoint_metadata"].get("checkpoint_metadata"),
         "seed": secrets.randbelow(2**31 - 100_000),
-        "max_steps": 40,
+        "max_steps": 32,
         "status": "preparing",
         "created_at": datetime.now(UTC).isoformat(),
         "result": None,
@@ -1128,7 +1649,7 @@ async def create_sqli_challenge(challenge: SqliChallengeRequest) -> dict[str, An
         raise HTTPException(status_code=503, detail="the isolated target could not prepare this challenge")
     async with SQLI_CHALLENGE_LOCK:
         session["status"] = "queued"
-    return {**_challenge_public(session), "max_steps": 40}
+    return {**_challenge_public(session), "max_steps": 32}
 
 
 @router.get("/sqli/challenges/{challenge_id}")
@@ -1202,6 +1723,9 @@ async def claim_sqli_challenge(request: Request) -> dict[str, Any]:
                 "run_id": session["run_id"],
                 "episode_id": session["episode_id"],
                 "training_run_id": session["training_run_id"],
+                "checkpoint_sha256": session["checkpoint_sha256"],
+                "checkpoint_policy_versions": session["checkpoint_policy_versions"],
+                "checkpoint_metadata": session["checkpoint_metadata"],
                 "seed": session["seed"],
                 "max_steps": session["max_steps"],
             }
@@ -1272,11 +1796,860 @@ async def _clear_target_challenge(challenge_id: str) -> bool:
         return False
 
 
-@router.get("/training-runs")
-async def list_training_runs(limit: int = 50) -> dict[str, Any]:
+def _all_training_runs() -> list[dict[str, Any]]:
+    repository = _repository()
+    records: list[dict[str, Any]] = []
+    offset = 0
+    while True:
+        page = repository.list_training_runs(100, offset)
+        records.extend(page)
+        if len(page) < 100:
+            return records
+        offset += len(page)
+
+
+def _pilot_evaluation_seed_schedule(training_seed: int, count: int = 15) -> list[int]:
+    """Create a campaign-unique seed block outside the training seed range."""
+    first = 1_000_000_000 + training_seed * 1_000
+    return [first + index for index in range(count)]
+
+
+def _pilot_wilson(successes: int, total: int) -> list[float] | None:
+    if total <= 0:
+        return None
+    z = 1.959963984540054
+    rate = successes / total
+    denominator = 1 + z * z / total
+    center = (rate + z * z / (2 * total)) / denominator
+    margin = z * ((rate * (1 - rate) / total + z * z / (4 * total * total)) ** 0.5) / denominator
+    return [max(0.0, center - margin), min(1.0, center + margin)]
+
+
+def _pilot_records(campaign_id: UUID) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    campaign_key = str(campaign_id)
+    records = [
+        item
+        for item in _all_training_runs()
+        if (item.get("config") or {}).get("pilot_campaign_id") == campaign_key
+    ]
+    training = [
+        item
+        for item in records
+        if (item.get("config") or {}).get("campaign_label") == "balanced_pilot_v1"
+    ]
+    evaluation = [
+        item
+        for item in records
+        if (item.get("config") or {}).get("campaign_label") == "balanced_pilot_evaluation_v1"
+    ]
+    return sorted(training, key=lambda item: int((item.get("config") or {}).get("seed", 0))), sorted(
+        evaluation, key=lambda item: int((item.get("config") or {}).get("seed", 0))
+    )
+
+
+def _pilot_status(campaign_id: UUID) -> dict[str, Any]:
+    training, evaluation = _pilot_records(campaign_id)
+    if not training:
+        raise HTTPException(status_code=404, detail="pilot campaign not found")
+
+    active_states = {"queued", "running"}
+    training_active = any(item.get("status") in active_states for item in training)
+    evaluation_active = any(item.get("status") in active_states for item in evaluation)
+    terminal = {"completed", "stopped", "failed"}
+    training_terminal = len(training) == 3 and all(item.get("status") in terminal for item in training)
+    checkpointable = [
+        item for item in training if _checkpoint_record_metadata(item) is not None
+    ]
+    if training_active or len(training) < 3:
+        status = "training"
+    elif evaluation_active:
+        status = "evaluation"
+    elif evaluation and all(item.get("status") in terminal for item in evaluation):
+        status = "completed" if len(evaluation) == 3 and all(
+            item.get("status") == "completed" for item in evaluation
+        ) else "incomplete"
+    elif training_terminal and not evaluation:
+        status = "ready_for_evaluation" if checkpointable else "incomplete"
+    else:
+        status = "incomplete"
+
+    training_rows = []
+    for item in training:
+        config = item.get("config") or {}
+        result = item.get("result") or {}
+        checkpoint = _checkpoint_record_metadata(item)
+        training_rows.append(
+            {
+                "seed": config.get("seed"),
+                "training_run_id": item.get("training_run_id"),
+                "status": item.get("status"),
+                "stop_requested": bool(item.get("stop_requested")),
+                "requested_episodes": int(config.get("episodes", 50)),
+                "completed_episodes": int(result.get("completed_training_episodes", 0)),
+                "attempted_episodes": int(result.get("episode_summary_count", 0)),
+                "policy_versions": result.get("policy_versions"),
+                "checkpoint_sha256": (checkpoint or {}).get("checkpoint_sha256"),
+                "checkpoint_available": checkpoint is not None,
+            }
+        )
+
+    eval_by_seed = {
+        int((item.get("config") or {}).get("seed", -1)): item for item in evaluation
+    }
+    per_seed: list[dict[str, Any]] = []
+    pooled_completed = pooled_red = pooled_blue = pooled_disclosures = 0
+    prevention_weighted = availability_weighted = exposure_weighted = 0.0
+    for item in training:
+        config = item.get("config") or {}
+        seed = int(config.get("seed", 0))
+        eval_run = eval_by_seed.get(seed)
+        eval_result = ((eval_run or {}).get("result") or {}).get("evaluation") or {}
+        completed = int(eval_result.get("completed_matches", 0))
+        red_wins = int(eval_result.get("red_wins", 0))
+        blue_wins = int(eval_result.get("blue_wins", 0))
+        disclosures = int(eval_result.get("verified_disclosures", 0))
+        pooled_completed += completed
+        pooled_red += red_wins
+        pooled_blue += blue_wins
+        pooled_disclosures += disclosures
+        for source, accumulator in (
+            ("verified_prevention_rate", "prevention"),
+            ("legitimate_service_availability", "availability"),
+            ("verified_exposure_rate", "exposure"),
+        ):
+            value = eval_result.get(source)
+            if isinstance(value, (int, float)):
+                if accumulator == "prevention":
+                    prevention_weighted += float(value) * completed
+                elif accumulator == "availability":
+                    availability_weighted += float(value) * completed
+                else:
+                    exposure_weighted += float(value) * completed
+        per_seed.append(
+            {
+                "training_seed": seed,
+                "training_run_id": item.get("training_run_id"),
+                "training_status": item.get("status"),
+                "completed_training_episodes": int(
+                    (item.get("result") or {}).get("completed_training_episodes", 0)
+                ),
+                "evaluation_run_id": (eval_run or {}).get("training_run_id"),
+                "evaluation_status": (eval_run or {}).get("status", "not_started"),
+                "evaluation_seeds": (eval_run or {}).get("config", {}).get("pilot_evaluation_seeds", []),
+                "requested_matches": int((eval_run or {}).get("config", {}).get("episodes", 15)),
+                "completed_matches": completed,
+                "incomplete_matches": max(0, int((eval_run or {}).get("config", {}).get("episodes", 15)) - completed),
+                "red_wins": red_wins,
+                "blue_wins": blue_wins,
+                "undecided_matches": int(eval_result.get("undecided_matches", 0)),
+                "red_win_rate": red_wins / completed if completed else None,
+                "blue_win_rate": blue_wins / completed if completed else None,
+                "red_win_rate_wilson_95": _pilot_wilson(red_wins, completed),
+                "blue_win_rate_wilson_95": _pilot_wilson(blue_wins, completed),
+                "verified_disclosures": disclosures,
+                "verified_exposure_rate": eval_result.get("verified_exposure_rate"),
+                "verified_prevention_rate": eval_result.get("verified_prevention_rate"),
+                "legitimate_service_availability": eval_result.get("legitimate_service_availability"),
+            }
+        )
+
+    requested_matches = 45
+    red_rate = pooled_red / pooled_completed if pooled_completed else None
+    blue_rate = pooled_blue / pooled_completed if pooled_completed else None
+    complete_evaluation = pooled_completed == requested_matches
+    within_balance = (
+        red_rate is not None
+        and blue_rate is not None
+        and red_rate >= 0.2
+        and blue_rate >= 0.2
+        and red_rate <= 0.8
+        and blue_rate <= 0.8
+    )
+    if complete_evaluation and within_balance:
+        balance_verdict = "balanced"
+    elif not complete_evaluation:
+        balance_verdict = "incomplete"
+    elif red_rate is not None and red_rate > 0.8:
+        balance_verdict = "red_dominant"
+    elif blue_rate is not None and blue_rate > 0.8:
+        balance_verdict = "blue_dominant"
+    else:
+        balance_verdict = "unbalanced"
+    start_config = (training[0].get("config") or {})
+    return {
+        "campaign_id": str(campaign_id),
+        "status": status,
+        "started_at": start_config.get("pilot_started_at"),
+        "training_deadline": start_config.get("pilot_training_deadline"),
+        "evaluation_deadline": start_config.get("pilot_evaluation_deadline"),
+        "interaction_protocol_schema_id": SQLI_INTERACTION_PROTOCOL_SCHEMA,
+        "reward_schema_id": SQLI_REWARD_SCHEMA,
+        "training": {
+            "requested_per_seed": 50,
+            "planned_seeds": [17, 18, 19],
+            "completed_updates": sum(item["completed_episodes"] for item in training_rows),
+            "requested_updates": 150,
+            "runs": training_rows,
+        },
+        "evaluation": {
+            "requested_matches": requested_matches,
+            "completed_matches": pooled_completed,
+            "incomplete_matches": max(0, requested_matches - pooled_completed),
+            "attempted_matches": sum(
+                int(((item.get("result") or {}).get("evaluation") or {}).get("attempted_matches", 0))
+                for item in evaluation
+            ),
+            "red_wins": pooled_red,
+            "blue_wins": pooled_blue,
+            "undecided_matches": max(0, pooled_completed - pooled_red - pooled_blue),
+            "red_win_rate": red_rate,
+            "blue_win_rate": blue_rate,
+            "red_win_rate_wilson_95": _pilot_wilson(pooled_red, pooled_completed),
+            "blue_win_rate_wilson_95": _pilot_wilson(pooled_blue, pooled_completed),
+            "verified_disclosures": pooled_disclosures,
+            "verified_exposure_rate": exposure_weighted / pooled_completed if pooled_completed else None,
+            "verified_prevention_rate": prevention_weighted / pooled_completed if pooled_completed else None,
+            "legitimate_service_availability": availability_weighted / pooled_completed if pooled_completed else None,
+            "per_seed": per_seed,
+            "balanced": complete_evaluation and within_balance,
+            "balance_verdict": balance_verdict,
+            "balance_rule": "each side wins at least 20% and neither side exceeds 80% of completed held-out matches",
+            "uncertainty_method": "Wilson score 95% intervals for pooled and per-seed win rates",
+        },
+    }
+
+
+def _sqli_target_available() -> bool:
+    health_path = SQLI_SPOOL / "health.json"
+    if not health_path.exists():
+        return False
+    try:
+        health = read_json(health_path)
+        updated = datetime.fromisoformat(str(health["updated_at"]))
+        if updated.tzinfo is None:
+            updated = updated.replace(tzinfo=UTC)
+        target = health.get("target") or {}
+        return (
+            (datetime.now(UTC) - updated.astimezone(UTC)).total_seconds() <= 15
+            and isinstance(target, dict)
+            and target.get("status") == "available"
+        )
+    except (OSError, KeyError, TypeError, ValueError):
+        return False
+
+
+@router.post("/sqli/pilots", status_code=202)
+async def start_balanced_pilot(_request: PilotStartRequest) -> dict[str, Any]:
+    """Start three fresh paired policies for the agreed 17/18/19 pilot."""
+    async with PILOT_LOCK:
+        active = [
+            item
+            for item in _all_training_runs()
+            if (item.get("config") or {}).get("campaign_label") in {
+                "balanced_pilot_v1",
+                "balanced_pilot_evaluation_v1",
+            }
+            and item.get("status") in {"queued", "running"}
+        ]
+        if active:
+            raise HTTPException(
+                status_code=409,
+                detail=f"pilot run {active[0].get('training_run_id')} is already active",
+            )
+        if not _sqli_target_available():
+            raise HTTPException(status_code=503, detail="the isolated SQLi target is unavailable")
+
+        now = datetime.now(UTC)
+        campaign_id = uuid4()
+        started_at = now.isoformat()
+        training_deadline = (now + timedelta(hours=3)).isoformat()
+        evaluation_deadline = (now + timedelta(hours=4)).isoformat()
+        created: list[dict[str, Any]] = []
+        try:
+            for seed in (17, 18, 19):
+                created.append(
+                    await create_training_run(
+                        TrainingRunRequest(
+                            role="joint",
+                            mode="train",
+                            run_kind="teaching",
+                            scenario_id="sqli_lab_v1",
+                            episodes=50,
+                            max_steps=32,
+                            seed=seed,
+                            opponent="none",
+                            campaign_label="balanced_pilot_v1",
+                            pilot_campaign_id=campaign_id,
+                            pilot_started_at=started_at,
+                            pilot_training_deadline=training_deadline,
+                            pilot_evaluation_deadline=evaluation_deadline,
+                            pilot_training_episodes_per_seed=50,
+                        )
+                    )
+                )
+        except Exception:
+            for item in created:
+                if item.get("status") in {"queued", "running"}:
+                    _repository().request_training_stop(str(item["training_run_id"]))
+            raise
+        return _pilot_status(campaign_id)
+
+
+@router.get("/sqli/pilots/{campaign_id}")
+async def get_balanced_pilot(campaign_id: UUID) -> dict[str, Any]:
+    return _pilot_status(campaign_id)
+
+
+@router.post("/sqli/pilots/{campaign_id}/evaluation", status_code=202)
+async def start_balanced_pilot_evaluation(campaign_id: UUID) -> dict[str, Any]:
+    """Queue one frozen held-out run for each seed with a verified checkpoint."""
+    async with PILOT_LOCK:
+        training, existing_evaluations = _pilot_records(campaign_id)
+        if not training:
+            raise HTTPException(status_code=404, detail="pilot campaign not found")
+        if any(item.get("status") in {"queued", "running"} for item in training):
+            raise HTTPException(status_code=409, detail="pilot training has not reached an episode boundary")
+        if not _sqli_target_available():
+            raise HTTPException(status_code=503, detail="the isolated SQLi target is unavailable")
+
+        deadline = (training[0].get("config") or {}).get("pilot_evaluation_deadline")
+        created: list[dict[str, Any]] = []
+        existing_seeds = {
+            int((item.get("config") or {}).get("seed", -1)) for item in existing_evaluations
+        }
+        for source in training:
+            config = source.get("config") or {}
+            seed = int(config["seed"])
+            if seed in existing_seeds:
+                continue
+            checkpoint = _checkpoint_record_metadata(source)
+            if checkpoint is None:
+                continue
+            evaluation_seeds = _pilot_evaluation_seed_schedule(seed)
+            created.append(
+                await create_training_run(
+                    TrainingRunRequest(
+                        role="joint",
+                        mode="evaluate",
+                        run_kind="teaching",
+                        scenario_id="sqli_lab_v1",
+                        episodes=15,
+                        max_steps=32,
+                        seed=seed,
+                        opponent="none",
+                        checkpoint_run_id=UUID(str(source["training_run_id"])),
+                        campaign_label="balanced_pilot_evaluation_v1",
+                        pilot_campaign_id=campaign_id,
+                        pilot_started_at=(training[0].get("config") or {}).get("pilot_started_at"),
+                        pilot_evaluation_deadline=deadline,
+                        pilot_training_episodes_per_seed=50,
+                        pilot_evaluation_seeds=evaluation_seeds,
+                    )
+                )
+            )
+        if not created and not existing_evaluations:
+            raise HTTPException(
+                status_code=409,
+                detail="no seed produced a verifiable checkpoint; the pilot cannot be evaluated",
+            )
+        return _pilot_status(campaign_id)
+
+
+def _seed_schedule(namespace_id: UUID, count: int, *, lower: int = 1_500_000_000) -> list[int]:
+    """Create deterministic, high-range held-out seeds independent of training seeds."""
+    modulus = 2**31 - 1
+    start = lower + namespace_id.int % max(1, modulus - lower - count)
+    return [(start + index) % modulus for index in range(count)]
+
+
+def _run_episode_summaries(record: dict[str, Any]) -> list[dict[str, Any]]:
+    rows = (record.get("result") or {}).get("episodes")
+    return [item for item in rows if isinstance(item, dict)] if isinstance(rows, list) else []
+
+
+def _metric_map(record: dict[str, Any], key: str) -> dict[int, float]:
+    values: dict[int, float] = {}
+    for item in _run_episode_summaries(record):
+        seed = item.get("seed")
+        raw = item.get(key)
+        if item.get("status") != "completed" or not isinstance(seed, int):
+            continue
+        if isinstance(raw, bool):
+            values[seed] = float(raw)
+        elif isinstance(raw, (int, float)):
+            values[seed] = float(raw)
+    return values
+
+
+def _paired_difference(initial: dict[int, float], later: dict[int, float], seed: int) -> dict[str, Any]:
+    paired = [later[key] - initial[key] for key in sorted(initial.keys() & later.keys())]
+    if not paired:
+        return {"matched_fixtures": 0, "mean_change": None, "bootstrap_ci_95": None}
+    mean = sum(paired) / len(paired)
+    if len(paired) < 2:
+        interval = None
+    else:
+        rng = random.Random(seed)
+        draws = sorted(
+            sum(paired[rng.randrange(len(paired))] for _ in paired) / len(paired)
+            for _ in range(2000)
+        )
+        interval = [draws[49], draws[1949]]
+    return {"matched_fixtures": len(paired), "mean_change": mean, "bootstrap_ci_95": interval}
+
+
+def _learning_report(evaluation_id: UUID) -> dict[str, Any]:
+    evaluation_key = str(evaluation_id)
+    records = [
+        item
+        for item in _all_training_runs()
+        if (item.get("config") or {}).get("learning_evaluation_id") == evaluation_key
+    ]
+    if not records:
+        raise HTTPException(status_code=404, detail="learning evaluation was not found")
+    source_id = str((records[0].get("config") or {}).get("checkpoint_run_id") or "")
+    by_variant = {
+        str((item.get("config") or {}).get("checkpoint_variant")): item
+        for item in records
+    }
+    initial = by_variant.get("initial")
+    later = by_variant.get("final")
+    report_status = (
+        "running"
+        if any(item.get("status") in {"queued", "running"} for item in records)
+        else "completed"
+        if initial and later and all(item.get("status") == "completed" for item in (initial, later))
+        else "incomplete"
+    )
+
+    def summarize(record: dict[str, Any] | None) -> dict[str, Any] | None:
+        if record is None:
+            return None
+        result = record.get("result") or {}
+        evaluation = result.get("evaluation") or {}
+        return {
+            "run_id": record.get("training_run_id"),
+            "status": record.get("status"),
+            "checkpoint_variant": (record.get("config") or {}).get("checkpoint_variant"),
+            "checkpoint_sha256": evaluation.get("checkpoint_sha256"),
+            "policy_versions": evaluation.get("policy_versions"),
+            "requested_matches": evaluation.get("requested_matches"),
+            "completed_matches": evaluation.get("completed_matches"),
+            "incomplete_matches": evaluation.get("incomplete_matches"),
+            "verified_red_success_rate": evaluation.get("verified_exposure_rate"),
+            "red_success_wilson_95": _pilot_wilson(
+                int(evaluation.get("verified_disclosures", 0)),
+                int(evaluation.get("completed_matches", 0)),
+            ),
+            "verified_blue_prevention_rate": evaluation.get("verified_prevention_rate"),
+            "legitimate_service_availability": evaluation.get("legitimate_service_availability"),
+            "evaluation_seeds": (record.get("config") or {}).get("learning_evaluation_seeds", []),
+            "frozen": evaluation.get("pair_frozen") is True,
+            "scripted_opponents": evaluation.get("scripted_opponents"),
+        }
+
+    changes: dict[str, Any] = {}
+    if initial and later:
+        metric_keys = {
+            "verified_red_success_rate": "verified_exposure",
+            "verified_blue_prevention_rate": "verified_prevention_rate",
+            "legitimate_service_availability": "legitimate_query_availability",
+        }
+        for report_key, episode_key in metric_keys.items():
+            changes[report_key] = _paired_difference(
+                _metric_map(initial, episode_key),
+                _metric_map(later, episode_key),
+                evaluation_id.int ^ sum(report_key.encode("utf-8")),
+            )
+    config = (records[0].get("config") or {})
+    initial_eval = ((initial or {}).get("result") or {}).get("evaluation") or {}
+    later_eval = ((later or {}).get("result") or {}).get("evaluation") or {}
+    return {
+        "schema_id": "violet.learning_report.v1",
+        "evaluation_id": evaluation_key,
+        "status": report_status,
+        "source_training_run_id": source_id,
+        "matched_seed_schedule": config.get("learning_evaluation_seeds", []),
+        "test_distribution": {
+            "target_version": SQLI_TARGET_VERSION,
+            "scenario_id": SQLI_SCENARIO_ID,
+            "vulnerable_configuration_probability": 0.5,
+            "description": "The same held-out, seeded server configurations are used for both frozen checkpoint pairs.",
+        },
+        "initial": summarize(initial),
+        "later": summarize(later),
+        "paired_changes": changes,
+        "family_results": {
+            "sql_injection": {
+                "status": report_status,
+                "initial": initial_eval,
+                "later": later_eval,
+            },
+            "unauthorized_record_access": {"status": "not_evaluated_in_sqli_scenario"},
+            "permission_or_workflow_abuse": {"status": "not_available_in_current_target"},
+        },
+        "claim_basis": "Matched frozen held-out outcome metrics only; training loss and action-probability changes are not treated as performance improvement.",
+    }
+
+
+@router.post("/learning-reports", status_code=202)
+async def start_learning_report(request: LearningReportStartRequest) -> dict[str, Any]:
+    async with EXPERIMENT_LOCK:
+        existing = [
+            item for item in _all_training_runs()
+            if (item.get("config") or {}).get("learning_evaluation_id") == str(request.evaluation_id)
+        ]
+        if existing:
+            return _learning_report(request.evaluation_id)
+        source = _repository().get_training_run(str(request.training_run_id))
+        if source is None or source.get("role") != "joint" or source.get("mode") != "train":
+            raise HTTPException(status_code=404, detail="joint training run was not found")
+        checkpoint = _checkpoint_record_metadata(source)
+        result = source.get("result") or {}
+        initial_digest = result.get("initial_checkpoint_sha256")
+        initial_versions = result.get("initial_policy_versions")
+        if (
+            checkpoint is None
+            or source.get("status") not in {"completed", "stopped"}
+            or not isinstance(initial_digest, str)
+            or len(initial_digest) != 64
+            or not isinstance(initial_versions, dict)
+        ):
+            raise HTTPException(status_code=409, detail="source run needs verified initial and final checkpoints")
+        if not _sqli_target_available():
+            raise HTTPException(status_code=503, detail="the isolated SQLi target is unavailable")
+        config = source.get("config") or {}
+        training_seeds = {
+            (int(config.get("seed", 0)) + index) % (2**31 - 1)
+            for index in range(int(config.get("episodes", 0)))
+        }
+        namespace = request.evaluation_id
+        base = _seed_schedule(namespace, request.matches)
+        for offset in range(100):
+            if not training_seeds.intersection(base):
+                break
+            namespace = UUID(int=(namespace.int + 1) % (2**128))
+            base = _seed_schedule(namespace, request.matches)
+        else:
+            raise HTTPException(status_code=409, detail="could not construct a disjoint evaluation seed schedule")
+        created: list[dict[str, Any]] = []
+        for variant in ("initial", "final"):
+            created.append(
+                await create_training_run(
+                    TrainingRunRequest(
+                        role="joint",
+                        mode="evaluate",
+                        run_kind="teaching",
+                        scenario_id="sqli_lab_v1",
+                        episodes=request.matches,
+                        max_steps=min(32, int(config.get("max_steps", 32))),
+                        seed=base[0],
+                        opponent="none",
+                        checkpoint_run_id=request.training_run_id,
+                        campaign_label="learning_evaluation_v1",
+                        checkpoint_variant=variant,
+                        learning_evaluation_id=request.evaluation_id,
+                        learning_evaluation_seeds=base,
+                        vulnerable_configuration_probability=0.5,
+                    )
+                )
+            )
+        return _learning_report(request.evaluation_id)
+
+
+@router.get("/learning-reports/{evaluation_id}")
+async def get_learning_report(evaluation_id: UUID) -> dict[str, Any]:
+    return _learning_report(evaluation_id)
+
+
+def _exposure_experiment_report(experiment_id: UUID) -> dict[str, Any]:
+    rows = [
+        item for item in _all_training_runs()
+        if (item.get("config") or {}).get("experiment_id") == str(experiment_id)
+    ]
+    if not rows:
+        raise HTTPException(status_code=404, detail="exposure experiment was not found")
+    branches: dict[str, dict[str, Any] | None] = {"control": None, "increased": None}
+    evaluations: dict[str, dict[str, Any] | None] = {"control": None, "increased": None}
+    for item in rows:
+        config = item.get("config") or {}
+        branch = config.get("experiment_branch")
+        if branch not in branches:
+            continue
+        target = evaluations if config.get("campaign_label") == "exposure_experiment_evaluation_v1" else branches
+        target[str(branch)] = item
+    training_active = any(item and item.get("status") in {"queued", "running"} for item in branches.values())
+    evaluation_active = any(item and item.get("status") in {"queued", "running"} for item in evaluations.values())
+    if training_active or any(item is None for item in branches.values()):
+        status = "training"
+    elif evaluation_active:
+        status = "evaluation"
+    elif all(evaluations.values()) and all(item and item.get("status") == "completed" for item in evaluations.values()):
+        status = "completed"
+    elif all(item and item.get("status") in {"completed", "stopped", "failed"} for item in branches.values()):
+        status = "ready_for_evaluation" if not any(evaluations.values()) else "incomplete"
+    else:
+        status = "incomplete"
+
+    def training_summary(record: dict[str, Any] | None) -> dict[str, Any] | None:
+        if record is None:
+            return None
+        config = record.get("config") or {}
+        result = record.get("result") or {}
+        summaries = _run_episode_summaries(record)
+        configured = [
+            bool((item.get("initial_server_configuration") or {}).get("vulnerable_configuration"))
+            for item in summaries
+            if isinstance(item.get("initial_server_configuration"), dict)
+        ]
+        completed = [item for item in summaries if item.get("status") == "completed"]
+        def mean(key: str) -> float | None:
+            found = [float(item[key]) for item in completed if isinstance(item.get(key), (int, float, bool))]
+            return sum(found) / len(found) if found else None
+        return {
+            "run_id": record.get("training_run_id"),
+            "status": record.get("status"),
+            "requested_updates": config.get("episodes"),
+            "completed_updates": result.get("completed_training_episodes", 0),
+            "checkpoint_sha256": result.get("checkpoint_sha256"),
+            "policy_versions": result.get("policy_versions"),
+            "configured_vulnerability_probability": config.get("vulnerable_configuration_probability"),
+            "realized_vulnerable_configuration_frequency": sum(configured) / len(configured) if configured else None,
+            "episodes_with_target_configuration": len(configured),
+            "verified_red_success_rate": mean("verified_exposure"),
+            "verified_blue_prevention_rate": mean("verified_prevention_rate"),
+            "legitimate_service_availability": mean("legitimate_query_availability"),
+        }
+
+    def evaluation_summary(record: dict[str, Any] | None) -> dict[str, Any] | None:
+        if record is None:
+            return None
+        result = record.get("result") or {}
+        return {
+            "run_id": record.get("training_run_id"),
+            "status": record.get("status"),
+            **(result.get("evaluation") or {}),
+            "evaluation_seeds": (record.get("config") or {}).get("experiment_episode_seeds", []),
+            "target_test_probability": (record.get("config") or {}).get("vulnerable_configuration_probability"),
+        }
+
+    first_config = (branches.get("control") or {}).get("config") or {}
+    return {
+        "schema_id": "violet.exposure_experiment.v1",
+        "experiment_id": str(experiment_id),
+        "status": status,
+        "family": "sql_injection",
+        "source_training_run_id": first_config.get("checkpoint_run_id"),
+        "equal_training_budget": bool(
+            branches["control"] and branches["increased"]
+            and (branches["control"].get("config") or {}).get("episodes")
+            == (branches["increased"].get("config") or {}).get("episodes")
+        ),
+        "matched_training_seeds": first_config.get("experiment_episode_seeds", []),
+        "training": {key: training_summary(value) for key, value in branches.items()},
+        "held_out_evaluation": {
+            "test_distribution_unchanged": True,
+            "same_seed_schedule": bool(
+                evaluations["control"] and evaluations["increased"]
+                and (evaluations["control"].get("config") or {}).get("experiment_episode_seeds")
+                == (evaluations["increased"].get("config") or {}).get("experiment_episode_seeds")
+            ),
+            "branches": {key: evaluation_summary(value) for key, value in evaluations.items()},
+        },
+        "interpretation": "Both branches start from the same source checkpoint and use equal episode budgets. Only the training probability for the SQL injection vulnerable server configuration changes; agents continue choosing all actions. Frozen evaluation uses the same fixtures at the same 0.5 test probability.",
+    }
+
+
+@router.post("/experiments/exposure", status_code=202)
+async def start_exposure_experiment(request: ExposureExperimentStartRequest) -> dict[str, Any]:
+    if request.increased_vulnerability_probability <= request.control_vulnerability_probability:
+        raise HTTPException(status_code=422, detail="increased exposure probability must exceed the control branch")
+    async with EXPERIMENT_LOCK:
+        existing = [
+            item for item in _all_training_runs()
+            if (item.get("config") or {}).get("experiment_id") == str(request.experiment_id)
+        ]
+        if existing:
+            return _exposure_experiment_report(request.experiment_id)
+        source = _repository().get_training_run(str(request.source_training_run_id))
+        if source is None or source.get("role") != "joint" or source.get("mode") != "train":
+            raise HTTPException(status_code=404, detail="joint source training run was not found")
+        checkpoint = _checkpoint_record_metadata(source)
+        if checkpoint is None or source.get("status") not in {"completed", "stopped"}:
+            raise HTTPException(status_code=409, detail="experiment source needs a verified completed checkpoint")
+        if not _sqli_target_available():
+            raise HTTPException(status_code=503, detail="the isolated SQLi target is unavailable")
+        config = source.get("config") or {}
+        training_seeds = [(request.seed + index) % (2**31 - 1) for index in range(request.episodes_per_branch)]
+        created: list[dict[str, Any]] = []
+        for branch, probability in (
+            ("control", request.control_vulnerability_probability),
+            ("increased", request.increased_vulnerability_probability),
+        ):
+            created.append(
+                await create_training_run(
+                    TrainingRunRequest(
+                        role="joint",
+                        mode="train",
+                        run_kind="teaching",
+                        scenario_id="sqli_lab_v1",
+                        episodes=request.episodes_per_branch,
+                        max_steps=min(32, int(config.get("max_steps", 32))),
+                        seed=request.seed,
+                        opponent="none",
+                        checkpoint_run_id=request.source_training_run_id,
+                        campaign_label="exposure_experiment_v1",
+                        experiment_id=request.experiment_id,
+                        experiment_branch=branch,
+                        vulnerable_configuration_probability=probability,
+                        experiment_episode_seeds=training_seeds,
+                        experiment_evaluation_matches=request.evaluation_matches,
+                    )
+                )
+            )
+        return _exposure_experiment_report(request.experiment_id)
+
+
+@router.get("/experiments/{experiment_id}")
+async def get_exposure_experiment(experiment_id: UUID) -> dict[str, Any]:
+    return _exposure_experiment_report(experiment_id)
+
+
+@router.post("/experiments/{experiment_id}/evaluation", status_code=202)
+async def start_exposure_experiment_evaluation(
+    experiment_id: UUID,
+    request: ExposureExperimentEvaluationRequest,
+) -> dict[str, Any]:
+    async with EXPERIMENT_LOCK:
+        all_runs = [
+            item for item in _all_training_runs()
+            if (item.get("config") or {}).get("experiment_id") == str(experiment_id)
+        ]
+        training = {
+            str((item.get("config") or {}).get("experiment_branch")): item
+            for item in all_runs
+            if (item.get("config") or {}).get("campaign_label") == "exposure_experiment_v1"
+        }
+        existing_evaluation = [
+            item for item in all_runs
+            if (item.get("config") or {}).get("campaign_label") == "exposure_experiment_evaluation_v1"
+        ]
+        if len(training) != 2:
+            raise HTTPException(status_code=404, detail="both exposure training branches were not found")
+        if existing_evaluation:
+            return _exposure_experiment_report(experiment_id)
+        if any(item.get("status") not in {"completed", "stopped"} for item in training.values()):
+            raise HTTPException(status_code=409, detail="both training branches must finish before held-out evaluation")
+        updates = [int((item.get("result") or {}).get("completed_training_episodes", 0)) for item in training.values()]
+        requested_updates = [int((item.get("config") or {}).get("episodes", 0)) for item in training.values()]
+        if updates[0] != updates[1] or updates[0] != requested_updates[0] or requested_updates[0] != requested_updates[1]:
+            raise HTTPException(status_code=409, detail="both branches must complete the same requested update budget")
+        if not _sqli_target_available():
+            raise HTTPException(status_code=503, detail="the isolated SQLi target is unavailable")
+        seeds = _seed_schedule(experiment_id, request.evaluation_matches, lower=1_800_000_000)
+        created: list[dict[str, Any]] = []
+        for branch in ("control", "increased"):
+            source = training[branch]
+            source_config = source.get("config") or {}
+            created.append(
+                await create_training_run(
+                    TrainingRunRequest(
+                        role="joint",
+                        mode="evaluate",
+                        run_kind="teaching",
+                        scenario_id="sqli_lab_v1",
+                        episodes=request.evaluation_matches,
+                        max_steps=min(32, int(source_config.get("max_steps", 32))),
+                        seed=seeds[0],
+                        opponent="none",
+                        checkpoint_run_id=UUID(str(source["training_run_id"])),
+                        campaign_label="exposure_experiment_evaluation_v1",
+                        experiment_id=experiment_id,
+                        experiment_branch=branch,
+                        vulnerable_configuration_probability=0.5,
+                        experiment_episode_seeds=seeds,
+                        experiment_evaluation_matches=request.evaluation_matches,
+                    )
+                )
+            )
+        return _exposure_experiment_report(experiment_id)
+
+
+def _decode_sqli_episode_cursor(cursor: str | None) -> tuple[datetime | None, str | None]:
+    if cursor is None:
+        return None, None
+    try:
+        raw = base64.urlsafe_b64decode(cursor + "=" * (-len(cursor) % 4))
+        payload = json.loads(raw)
+        created_at = datetime.fromisoformat(payload["created_at"])
+        episode_id = str(UUID(payload["episode_id"]))
+        if created_at.tzinfo is None:
+            created_at = created_at.replace(tzinfo=UTC)
+        return created_at.astimezone(UTC), episode_id
+    except (binascii.Error, KeyError, TypeError, ValueError, json.JSONDecodeError):
+        raise HTTPException(status_code=422, detail="invalid SQLi episode cursor") from None
+
+
+def _encode_sqli_episode_cursor(item: dict[str, Any]) -> str:
+    value = json.dumps(
+        {"created_at": item["created_at"], "episode_id": item["episode_id"]},
+        separators=(",", ":"),
+    ).encode()
+    return base64.urlsafe_b64encode(value).decode().rstrip("=")
+
+
+@router.get("/sqli/episodes")
+async def list_sqli_episodes(
+    cursor: str | None = None,
+    limit: int = 50,
+    run_id: UUID | None = None,
+    phase: str | None = None,
+    status: str | None = None,
+    outcome: str | None = None,
+) -> dict[str, Any]:
+    """Browse SQLi episodes across every persisted run without target traffic."""
     if not 1 <= limit <= 100:
         raise HTTPException(status_code=422, detail="limit must be between 1 and 100")
-    return {"items": _repository().list_training_runs(limit)}
+    if phase is not None and phase not in {"training", "evaluation", "challenge", "other"}:
+        raise HTTPException(status_code=422, detail="invalid SQLi episode phase")
+    if status is not None and status not in {"running", "completed", "incomplete", "failed"}:
+        raise HTTPException(status_code=422, detail="invalid SQLi episode status")
+    if outcome is not None and outcome not in {"red", "blue", "tie", "no_winner", "unknown"}:
+        raise HTTPException(status_code=422, detail="invalid SQLi episode outcome")
+
+    cursor_created_at, cursor_episode_id = _decode_sqli_episode_cursor(cursor)
+    page = _repository().list_sqli_episodes(
+        target_version=SQLI_TARGET_VERSION,
+        limit=limit + 1,
+        cursor_created_at=cursor_created_at,
+        cursor_episode_id=cursor_episode_id,
+        run_id=str(run_id) if run_id else None,
+        phase=phase,
+        status=status,
+        outcome=outcome,
+    )
+    has_more = len(page) > limit
+    items = page[:limit]
+    return {
+        "cursor": cursor,
+        "next_cursor": _encode_sqli_episode_cursor(items[-1]) if has_more and items else None,
+        "has_more": has_more,
+        "items": items,
+    }
+
+
+@router.get("/training-runs")
+async def list_training_runs(limit: int = 50, offset: int = 0) -> dict[str, Any]:
+    if not 1 <= limit <= 100:
+        raise HTTPException(status_code=422, detail="limit must be between 1 and 100")
+    if offset < 0:
+        raise HTTPException(status_code=422, detail="offset must be non-negative")
+    page = _repository().list_training_runs(limit + 1, offset)
+    return {
+        "items": page[:limit],
+        "next_offset": offset + min(limit, len(page)),
+        "has_more": len(page) > limit,
+    }
 
 
 @router.get("/training-runs/{training_run_id}")
@@ -1425,6 +2798,8 @@ async def submit_sqli_control(submission: SqliControlRequest, request: Request) 
         episode_id=submission.episode_id,
         decision_id=submission.decision_id,
         action=submission.action,
+        vulnerable_configuration_probability=submission.vulnerable_configuration_probability,
+        fixture_seed=submission.fixture_seed,
     )
     SQLI_CONTROL_INBOX.mkdir(parents=True, exist_ok=True)
     write_json_atomic(

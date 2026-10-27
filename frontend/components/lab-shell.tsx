@@ -18,7 +18,11 @@ export default function LabShell({ children }: { children: React.ReactNode }) {
         </Link>
         <nav className="primary-nav" aria-label="Main navigation">
           <Link href="/" aria-current={pathname === "/" ? "page" : undefined}>Training</Link>
-          <Link href="/challenge" aria-current={pathname.startsWith("/challenge") ? "page" : undefined}>Challenge</Link>
+          <Link href="/server" aria-current={pathname.startsWith("/server") ? "page" : undefined}>Server Live</Link>
+          <Link href="/breaches" aria-current={pathname.startsWith("/breaches") ? "page" : undefined}>Breaches</Link>
+          <Link href="/episodes" aria-current={pathname.startsWith("/episodes") ? "page" : undefined}>Episodes</Link>
+          <Link href="/learning" aria-current={pathname.startsWith("/learning") ? "page" : undefined}>Learning</Link>
+          <Link href="/experiments" aria-current={pathname.startsWith("/experiments") ? "page" : undefined}>Experiments</Link>
         </nav>
         <div className="shell-boundary"><ShieldCheck size={14} aria-hidden="true" /><span>localhost · isolated target</span></div>
       </header>

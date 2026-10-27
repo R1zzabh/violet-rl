@@ -567,10 +567,13 @@ class EventRepository:
                 "config": record.config,
             }
 
-    def list_training_runs(self, limit: int = 50) -> list[dict[str, Any]]:
+    def list_training_runs(self, limit: int = 50, offset: int = 0) -> list[dict[str, Any]]:
         with self.sessions() as session:
             records = session.scalars(
-                select(TrainingRunRecord).order_by(TrainingRunRecord.created_at.desc()).limit(limit)
+                select(TrainingRunRecord)
+                .order_by(TrainingRunRecord.created_at.desc(), TrainingRunRecord.training_run_id.desc())
+                .offset(max(0, offset))
+                .limit(limit)
             ).all()
             return [self._training_run_payload(record) for record in records]
 
@@ -599,14 +602,25 @@ class EventRepository:
                 for record in records
             ]
 
-    def list_episodes(self, run_id: str, limit: int = 100) -> list[dict[str, Any]]:
+    def list_episodes(
+        self,
+        run_id: str,
+        limit: int = 100,
+        *,
+        after_index: int | None = None,
+        before_index: int | None = None,
+    ) -> list[dict[str, Any]]:
         with self.sessions() as session:
-            records = session.scalars(
-                select(Episode)
-                .where(Episode.run_id == run_id)
-                .order_by(Episode.episode_index.desc())
-                .limit(limit)
-            ).all()
+            statement = select(Episode).where(Episode.run_id == run_id)
+            if after_index is not None:
+                statement = statement.where(Episode.episode_index > after_index)
+                statement = statement.order_by(Episode.episode_index.asc())
+                records = session.scalars(statement.limit(limit)).all()
+            else:
+                if before_index is not None:
+                    statement = statement.where(Episode.episode_index < before_index)
+                statement = statement.order_by(Episode.episode_index.desc())
+                records = list(reversed(session.scalars(statement.limit(limit)).all()))
             return [
                 {
                     "episode_id": record.episode_id,
@@ -617,8 +631,179 @@ class EventRepository:
                     "config": record.config,
                     "created_at": self._timestamp(record.created_at),
                 }
-                for record in reversed(records)
+                for record in records
             ]
+
+    def list_sqli_episodes(
+        self,
+        *,
+        target_version: str,
+        limit: int = 51,
+        cursor_created_at: datetime | None = None,
+        cursor_episode_id: str | None = None,
+        run_id: str | None = None,
+        phase: str | None = None,
+        status: str | None = None,
+        outcome: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Cursor-scan persisted SQLi episodes across training and challenge runs."""
+        if (cursor_created_at is None) != (cursor_episode_id is None):
+            raise ValueError("both cursor timestamp and episode ID are required")
+        with self.sessions() as session:
+            batch_size = max(100, min(500, limit * 2))
+            scan_created_at = cursor_created_at
+            scan_episode_id = cursor_episode_id
+            found: list[dict[str, Any]] = []
+            while len(found) <= limit:
+                statement = (
+                    select(Episode, Run, TrainingRunRecord)
+                    .join(Run, Run.run_id == Episode.run_id)
+                    .outerjoin(
+                        TrainingRunRecord,
+                        TrainingRunRecord.training_run_id == Run.run_id,
+                    )
+                    .where(Run.target_version == target_version)
+                )
+                if run_id is not None:
+                    statement = statement.where(Episode.run_id == run_id)
+                if status is not None:
+                    statement = statement.where(Episode.status == status)
+                if scan_created_at is not None and scan_episode_id is not None:
+                    query_created_at = scan_created_at
+                    if self.engine.dialect.name == "sqlite" and query_created_at.tzinfo is not None:
+                        query_created_at = query_created_at.replace(tzinfo=None)
+                    statement = statement.where(
+                        (Episode.created_at < query_created_at)
+                        | (
+                            (Episode.created_at == query_created_at)
+                            & (Episode.episode_id < scan_episode_id)
+                        )
+                    )
+                rows = session.execute(
+                    statement.order_by(Episode.created_at.desc(), Episode.episode_id.desc())
+                    .limit(batch_size)
+                ).all()
+                if not rows:
+                    break
+
+                episode_ids = [episode.episode_id for episode, _run, _training in rows]
+                event_rows = session.scalars(
+                    select(RunEvent)
+                    .where(
+                        RunEvent.episode_id.in_(episode_ids),
+                        RunEvent.event_type.in_(
+                            {"sqli_episode_started", "sqli_episode_summary", "sqli_episode_outcome"}
+                        ),
+                    )
+                    .order_by(RunEvent.seq)
+                ).all()
+                events_by_episode: dict[str, dict[str, dict[str, Any]]] = {}
+                for event in event_rows:
+                    selected = events_by_episode.setdefault(event.episode_id or "", {})
+                    if event.event_type == "sqli_episode_started":
+                        selected.setdefault(
+                            "started",
+                            {
+                                "occurred_at": self._timestamp(event.occurred_at),
+                                "payload": event.payload,
+                            },
+                        )
+                    else:
+                        selected["outcome" if event.event_type == "sqli_episode_outcome" else "summary"] = {
+                            "occurred_at": self._timestamp(event.occurred_at),
+                            "payload": event.payload,
+                        }
+
+                for episode, run, training_record in rows:
+                    scan_created_at = episode.created_at
+                    scan_episode_id = episode.episode_id
+                    records = events_by_episode.get(episode.episode_id, {})
+                    started = records.get("started") or {}
+                    outcome_record = records.get("outcome") or records.get("summary") or {}
+                    started_payload = started.get("payload") or {}
+                    outcome_payload = outcome_record.get("payload") or {}
+                    raw_phase = (
+                        outcome_payload.get("phase")
+                        or outcome_payload.get("kind")
+                        or started_payload.get("episode_kind")
+                    )
+                    if raw_phase == "training":
+                        episode_phase = "training"
+                    elif raw_phase == "challenge":
+                        episode_phase = "challenge"
+                    elif raw_phase in {
+                        "candidate",
+                        "held_out_evaluation",
+                        "evaluation_comparator",
+                        "evaluation",
+                    }:
+                        episode_phase = "evaluation"
+                    else:
+                        episode_phase = "other"
+
+                    winner = outcome_payload.get("winner")
+                    if winner == "red" or winner == "blue":
+                        outcome_key = str(winner)
+                    elif winner == "tie" or winner == "draw":
+                        outcome_key = "tie"
+                    elif outcome_record:
+                        outcome_key = "no_winner"
+                    else:
+                        outcome_key = "unknown"
+                    if phase is not None and episode_phase != phase:
+                        continue
+                    if outcome is not None and outcome_key != outcome:
+                        continue
+
+                    training_config = training_record.config if training_record is not None else {}
+                    episode_outcome = None
+                    if outcome_record:
+                        episode_outcome = {
+                            "status": outcome_payload.get("status"),
+                            "winner": winner,
+                            "reason": outcome_payload.get("reason"),
+                            "verified_exposure": outcome_payload.get("verified_exposure"),
+                            "challenge_disclosed": outcome_payload.get("challenge_disclosed"),
+                            "steps": outcome_payload.get("steps"),
+                            "red_return": outcome_payload.get("red_return"),
+                            "blue_return": outcome_payload.get("blue_return"),
+                        }
+                    found.append(
+                        {
+                            "episode_id": episode.episode_id,
+                            "run_id": episode.run_id,
+                            "episode_index": episode.episode_index,
+                            "status": episode.status,
+                            "seed": episode.seed,
+                            "created_at": self._timestamp(episode.created_at),
+                            "timestamp": started.get("occurred_at") or self._timestamp(episode.created_at),
+                            "phase": episode_phase,
+                            "run_mode": (
+                                training_record.mode
+                                if training_record is not None
+                                else "challenge"
+                                if episode_phase == "challenge"
+                                else run.mode
+                            ),
+                            "run_type": training_config.get("run_kind")
+                            or ("challenge" if episode_phase == "challenge" else "other"),
+                            "run_status": (
+                                training_record.status
+                                if training_record is not None
+                                else outcome_payload.get("status")
+                                if outcome_record and outcome_payload.get("status") is not None
+                                else run.status
+                            ),
+                            "outcome_key": outcome_key,
+                            "outcome": episode_outcome,
+                            "policy_versions_at_start": started_payload.get("policy_versions"),
+                        }
+                    )
+                    if len(found) > limit:
+                        break
+                if len(rows) < batch_size or len(found) > limit:
+                    break
+            return found
 
     def request_training_stop(self, training_run_id: str) -> dict[str, Any] | None:
         with self.sessions.begin() as session:

@@ -98,6 +98,7 @@ class SqliExecutor:
             "X-Range-Decision-ID": str(job.decision_id),
             "X-Range-Request-ID": str(job.request_id),
             "X-Range-Actor": actor_ref,
+            "X-Range-Purpose": job.purpose,
         }
         if job.challenge_id is not None:
             headers["X-Range-Challenge-ID"] = str(job.challenge_id)

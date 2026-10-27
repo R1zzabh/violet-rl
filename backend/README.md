@@ -27,25 +27,30 @@ frontend ports bind to loopback.
 
 ## Real-range workflow
 
-Open `/` for the live SQLi Red/Blue training monitor and `/challenge` to run the
-latest completed joint PPO checkpoint against one disposable test phrase. The
-challenge phrase stays in volatile API/target memory and is omitted from event
-records and executor results. Open legacy `/range` and `/sqli` paths redirect
-to the two-page classroom surface. The SQLi
-training uses separate Red and Blue PPO actors, critics, optimizers, random
-streams, and policy versions. The pair stays fixed within each episode;
-accepted transitions are stored before either role updates at the boundary.
-Unknown or rejected outcomes never enter PPO data. Red selects bounded action
-components that the executor composes into a request parameter; Blue acts on
-sanitized HTTP telemetry and the target applies its typed control. The no-defense
-comparator is evaluation-only.
+Open `/` for explicit training presets and the three-seed pilot. The **Server
+Live** page shows target-recorded SQLi execution stages; **Episodes** replays
+saved decisions, transitions, rewards, and PPO diagnostics; **Breaches** indexes
+verified SQLi disclosures; **Learning** compares initial and later checkpoint
+pairs on matched held-out fixtures; and **Experiments** creates equal-budget
+branches with different SQLi vulnerable-configuration frequencies. The optional
+`/challenge` route uses one disposable phrase stored in API/target memory and
+redacted from persistent event records.
 
-The classroom campaign uses one seed, 10,000 completed PPO-updated episodes,
-and up to 40 rounds per episode. It checkpoints the joint model and optimizer
-state after every episode, then runs 500 held-out seeded matches with the pair
-frozen. Those outcomes come from correlated target HTTP evidence and remain
-separate from training results; the run is labeled as a demonstration rather
-than a multi-seed research claim.
+The SQLi actor–critic policies have separate recurrent state, optimizers, random
+streams, and policy versions. The pair stays fixed within each episode; accepted
+transitions are stored before either role updates at the boundary. Unknown or
+rejected outcomes never enter PPO batches. The five-update demonstration uses
+short CPU runs. The 10,000-update preset checkpoints after each completed
+episode; stop it at an episode boundary and resume from its saved checkpoint.
+New SQLi episodes have a 32-round maximum. The balanced classroom pilot trains
+three fresh seeds for up to 50 updates each and has 45 frozen held-out matches.
+These results describe the completed runs and do not by themselves establish
+general policy improvement.
+
+The learning and exposure reports cover the SQLi target only. Violet Ledger
+continues to provide a separate verified IDOR exercise. Permission or workflow
+abuse is not yet implemented, and the current recurrent PPO pair does not train
+on the Ledger scenario.
 
 The Ledger training flow updates separate Red and Blue policies after the same
 completed episode. Teaching runs can be short; research training

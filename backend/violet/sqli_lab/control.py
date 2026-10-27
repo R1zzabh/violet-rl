@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import random
 import time
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
@@ -28,6 +29,8 @@ class SqliRuntime:
         self.guest_requests: dict[str, int] = {}
         self.state_version = 0
         self.challenge_secrets: dict[str, tuple[str, float]] = {}
+        self.vulnerable_configuration_probability = 1.0
+        self.fixture_seed: int | None = None
 
     def set_challenge(self, challenge_id: str, phrase: str, ttl_seconds: float = 900.0) -> None:
         now = time.monotonic()
@@ -51,7 +54,10 @@ class SqliRuntime:
 
     def apply(self, command: SqliControlCommand) -> SqliControlAcknowledgement:
         if command.action == "RESET":
-            self.parameterized = False
+            self.vulnerable_configuration_probability = command.vulnerable_configuration_probability
+            self.fixture_seed = command.fixture_seed
+            draw = random.Random(command.fixture_seed).random() if command.fixture_seed is not None else 0.0
+            self.parameterized = draw >= self.vulnerable_configuration_probability
             self.rate_limit_guest = False
             self.isolate_guest_remaining = 0
             self.guest_requests.clear()
@@ -78,6 +84,9 @@ class SqliRuntime:
             "rate_limit_guest": self.rate_limit_guest,
             "isolate_guest_remaining": self.isolate_guest_remaining,
             "state_version": self.state_version,
+            "vulnerable_configuration_probability": self.vulnerable_configuration_probability,
+            "fixture_seed": self.fixture_seed,
+            "vulnerable_configuration": not self.parameterized,
         }
 
     def check_request(self, actor_ref: str, episode_id: str) -> tuple[int | None, str | None]:

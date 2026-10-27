@@ -20,7 +20,9 @@ ControlAction = Literal["MONITOR", "PARAMETERIZE_QUERY", "RATE_LIMIT_GUEST", "IS
 
 OBSERVATION_SCHEMA = "sqli.range_observation.v1"
 ACTION_SCHEMA = "sqli.composed_action.v1"
-REWARD_SCHEMA = "sqli.reward.v1"
+INTERACTION_PROTOCOL_SCHEMA = "sqli.round_protocol.v2"
+LEGACY_INTERACTION_PROTOCOL_SCHEMA = "sqli.round_protocol.red_first.v1"
+REWARD_SCHEMA = "sqli.reward.v3"
 FEATURE_SCHEMA = "sqli.range_features.v1"
 SCENARIO_ID = "sqli_lab_v1"
 TARGET_VERSION = "sqli_target_v1"
@@ -141,6 +143,8 @@ class SqliControlCommand(StrictModel):
     episode_id: UUID
     decision_id: UUID | None = None
     action: Literal["RESET", "PARAMETERIZE_QUERY", "RATE_LIMIT_GUEST", "ISOLATE_GUEST_LOOKUP"]
+    vulnerable_configuration_probability: float = Field(default=1.0, ge=0.0, le=1.0)
+    fixture_seed: int | None = Field(default=None, ge=0, le=2**31 - 1)
 
 
 class SqliControlAcknowledgement(StrictModel):

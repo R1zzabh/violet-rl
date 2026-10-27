@@ -1,463 +1,403 @@
 "use client";
 
-import Link from "next/link";
-import { useCallback, useEffect, useMemo, useState } from "react";
-import {
-  Activity,
-  AlertTriangle,
-  ArrowRight,
-  Bug,
-  CircleStop,
-  RefreshCw,
-  ShieldCheck,
-} from "lucide-react";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { AlertTriangle, Bug, CircleStop, Clock3, Play, RefreshCw, Save, ShieldCheck } from "lucide-react";
 import {
   rangeApi,
-  type RangeEvent,
+  type SqliPilotStatus,
   type SqliTargetStatus,
   type TrainingRun,
+  type TrainingUpdateRecord,
 } from "../lib/range-api";
 
-type Numeric = number | null;
-type Outcome = RangeEvent & { payload: Record<string, unknown> };
-type ChartLine = { label: string; color: string; values: Numeric[] };
+const STORAGE_KEY = "violet.sqli.balanced-pilot";
+const PRESET_RUN_KEY = "violet.sqli.training-preset-run";
+const pct = (value: number | null) => value === null ? "—" : `${(value * 100).toFixed(1)}%`;
+const time = (value: string | null) => {
+  if (!value) return "—";
+  const date = new Date(value);
+  return Number.isNaN(date.valueOf()) ? "—" : `${date.toISOString().slice(0, 16).replace("T", " ")} UTC`;
+};
+const interval = (range: [number, number] | null) =>
+  range ? `${pct(range[0])}–${pct(range[1])}` : "unavailable";
 
-function object(value: unknown): Record<string, unknown> {
-  return value && typeof value === "object" && !Array.isArray(value)
-    ? value as Record<string, unknown>
-    : {};
+function stateLabel(status: SqliPilotStatus["status"] | undefined): string {
+  switch (status) {
+    case "training": return "Training in progress";
+    case "ready_for_evaluation": return "Training complete · evaluation starting";
+    case "evaluation": return "Held-out evaluation in progress";
+    case "completed": return "Pilot complete";
+    case "incomplete": return "Pilot incomplete";
+    default: return "No pilot started";
+  }
 }
 
-function number(value: unknown): number | null {
-  return typeof value === "number" && Number.isFinite(value) ? value : null;
-}
+function TrainingPresets({ targetAvailable }: { targetAvailable: boolean }) {
+  const [runs, setRuns] = useState<TrainingRun[]>([]);
+  const [run, setRun] = useState<TrainingRun | null>(null);
+  const [updates, setUpdates] = useState<TrainingUpdateRecord[]>([]);
+  const [sourceId, setSourceId] = useState("");
+  const [loading, setLoading] = useState(true);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
 
-function text(value: unknown, fallback = "—"): string {
-  return typeof value === "string" && value.length ? value : fallback;
-}
+  const eligibleSources = runs.filter((item) => item.role === "joint" && item.mode === "train"
+    && item.config.scenario_id === "sqli_lab_v1" && ["completed", "stopped"].includes(item.status)
+    && typeof item.result?.checkpoint_sha256 === "string");
+  const active = Boolean(run && ["queued", "running"].includes(run.status));
+  const updateIndexes = new Set(updates.filter((item) => item.role === "red").map((item) => item.update_index));
+  const completed = updateIndexes.size;
+  const requested = Number(run?.config.episodes ?? 0);
+  const progress = requested ? Math.min(100, completed * 100 / requested) : 0;
 
-function pct(value: Numeric): string {
-  return value === null ? "—" : `${Math.round(value * 100)}%`;
-}
+  const refreshRun = useCallback(async (id: string) => {
+    const [nextRun, nextUpdates] = await Promise.all([rangeApi.trainingRun(id), rangeApi.trainingUpdates(id)]);
+    setRun(nextRun);
+    setUpdates(nextUpdates.items);
+    return nextRun;
+  }, []);
 
-function movingAverage(values: Numeric[], width = 100): Numeric[] {
-  return values.map((_value, index) => {
-    const window = values.slice(Math.max(0, index - width + 1), index + 1)
-      .filter((item): item is number => item !== null);
-    return window.length ? window.reduce((sum, item) => sum + item, 0) / window.length : null;
-  });
-}
+  const refreshSources = useCallback(async () => {
+    const page = await rangeApi.trainingRuns(100);
+    setRuns(page.items);
+    return page.items;
+  }, []);
 
-function downsample(values: Numeric[], limit = 64): Numeric[] {
-  if (values.length <= limit) return values;
-  return Array.from({ length: limit }, (_item, index) => {
-    const sourceIndex = Math.round(index * (values.length - 1) / (limit - 1));
-    return values[sourceIndex] ?? null;
-  });
-}
+  useEffect(() => {
+    let cancelled = false;
+    async function load() {
+      try {
+        const page = await rangeApi.trainingRuns(100);
+        if (cancelled) return;
+        setRuns(page.items);
+        const savedId = window.localStorage.getItem(PRESET_RUN_KEY);
+        if (savedId) {
+          try { await refreshRun(savedId); }
+          catch { if (!cancelled) window.localStorage.removeItem(PRESET_RUN_KEY); }
+        }
+        const lastCheckpoint = page.items.find((item) => item.role === "joint" && item.mode === "train"
+          && item.config.scenario_id === "sqli_lab_v1" && ["completed", "stopped"].includes(item.status)
+          && typeof item.result?.checkpoint_sha256 === "string");
+        if (!cancelled && lastCheckpoint) setSourceId(lastCheckpoint.training_run_id);
+      } catch (reason) {
+        if (!cancelled) setError(reason instanceof Error ? reason.message : "Training run history could not be loaded.");
+      } finally {
+        if (!cancelled) setLoading(false);
+      }
+    }
+    void load();
+    return () => { cancelled = true; };
+  }, [refreshRun]);
 
-function TrendChart({ lines, labels, fixedRange }: {
-  lines: ChartLine[];
-  labels?: [string, string];
-  fixedRange?: [number, number];
-}) {
-  const available = lines.some((line) => line.values.some((value) => value !== null));
-  if (!available) return <div className="chart-empty">Waiting for the first verified episode</div>;
+  useEffect(() => {
+    if (!run?.training_run_id || !["queued", "running"].includes(run.status)) return;
+    const timer = window.setInterval(() => {
+      void refreshRun(run.training_run_id).catch((reason: unknown) => setError(reason instanceof Error ? reason.message : "Training status refresh failed."));
+    }, 3000);
+    return () => window.clearInterval(timer);
+  }, [run?.training_run_id, run?.status, refreshRun]);
 
-  const sampled = lines.map((line) => ({ ...line, values: downsample(line.values) }));
-  const all = sampled.flatMap((line) => line.values.filter((value): value is number => value !== null));
-  const low = fixedRange?.[0] ?? Math.min(0, ...all);
-  const high = fixedRange?.[1] ?? Math.max(1, ...all);
-  const range = Math.max(1e-6, high - low);
-  const width = 620;
-  const height = 150;
-  const left = 36;
-  const right = 12;
-  const top = 12;
-  const bottom = 25;
-  const plotWidth = width - left - right;
-  const plotHeight = height - top - bottom;
-  const coords = (values: Numeric[]) => values
-    .map((value, index) => value === null ? null : {
-      x: left + (values.length <= 1 ? 0 : index * plotWidth / (values.length - 1)),
-      y: top + (high - value) * plotHeight / range,
-    });
+  async function start(episodes: number, runKind: "teaching" | "research", checkpointRunId?: string) {
+    setBusy(true);
+    setError("");
+    try {
+      const currentTarget = await rangeApi.sqliTargetStatus();
+      if (currentTarget.status !== "available") throw new Error("The isolated SQLi target is unavailable.");
+      const created = await rangeApi.createTrainingRun({
+        role: "joint",
+        mode: "train",
+        run_kind: runKind,
+        episodes,
+        max_steps: 32,
+        seed: 17,
+        opponent: "none",
+        scenario_id: "sqli_lab_v1",
+        ...(checkpointRunId ? { checkpoint_run_id: checkpointRunId } : {}),
+      });
+      window.localStorage.setItem(PRESET_RUN_KEY, created.training_run_id);
+      setRun(created);
+      setUpdates([]);
+      await refreshSources();
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "Training run could not be queued.");
+    } finally {
+      setBusy(false);
+    }
+  }
 
-  return (
-    <div className="chart-wrap">
-      <svg className="chart-svg" viewBox={`0 0 ${width} ${height}`} role="img" aria-label={lines.map((line) => line.label).join(" and ")}>
-        {[0, 1, 2, 3].map((tick) => {
-          const y = top + tick * plotHeight / 3;
-          const value = high - tick * range / 3;
-          return <g key={tick}>
-            <line className="chart-grid-line" x1={left} y1={y} x2={width - right} y2={y} />
-            <text className="chart-axis-label" x={left - 7} y={y + 3} textAnchor="end">
-              {fixedRange ? `${Math.round(value * 100)}%` : Number.isInteger(value) ? value : value.toFixed(1)}
-            </text>
-          </g>;
-        })}
-        {sampled.map((line) => {
-          const points = coords(line.values);
-          let current: string[] = [];
-          const groups: string[][] = [];
-          for (const point of points) {
-            if (point) current.push(`${point.x},${point.y}`);
-            else if (current.length) { groups.push(current); current = []; }
-          }
-          if (current.length) groups.push(current);
-          return groups.map((group, index) => (
-            <polyline key={`${line.label}-${index}`} className="chart-line" stroke={line.color} points={group.join(" ")} />
-          ));
-        })}
-        <text className="chart-axis-label" x={left} y={height - 5}>{labels?.[0] ?? "start"}</text>
-        <text className="chart-axis-label" x={width - right} y={height - 5} textAnchor="end">{labels?.[1] ?? "latest"}</text>
-      </svg>
+  async function stop() {
+    if (!run) return;
+    setBusy(true);
+    try { setRun(await rangeApi.stopTrainingRun(run.training_run_id)); }
+    catch (reason) { setError(reason instanceof Error ? reason.message : "Stop request failed."); }
+    finally { setBusy(false); }
+  }
+
+  async function refresh() {
+    setBusy(true);
+    try {
+      if (run) await refreshRun(run.training_run_id);
+      await refreshSources();
+      setError("");
+    } catch (reason) { setError(reason instanceof Error ? reason.message : "Training state could not be refreshed."); }
+    finally { setBusy(false); setLoading(false); }
+  }
+
+  return <section className="panel training-presets">
+    <div className="training-presets-head"><div><span className="panel-kicker">CPU training presets</span><h2>Demonstrate or continue learning</h2><p>Each episode runs on the local HTTP target. The joint pair freezes during an episode, then both policies update from eligible saved transitions.</p></div>
+      <button className="button button-secondary button-small" onClick={() => void refresh()} disabled={busy}><RefreshCw size={13} />Refresh</button></div>
+    <div className="training-presets-actions">
+      <button className="button button-secondary" onClick={() => void start(5, "teaching")} disabled={busy || active || !targetAvailable}><Play size={14} />Start 5-update demonstration</button>
+      <button className="button" onClick={() => void start(10000, "research")} disabled={busy || active || !targetAvailable}><Clock3 size={14} />Start 10,000-update long run</button>
+      {active && <button className="button button-secondary" onClick={() => void stop()} disabled={busy}><CircleStop size={14} />Stop after current episode</button>}
     </div>
-  );
-}
-
-function Legend({ lines }: { lines: ChartLine[] }) {
-  return <div className="chart-legend">{lines.map((line) => (
-    <span className="legend-item" key={line.label}>
-      <span className="legend-swatch" style={{ background: line.color }} />{line.label}
-    </span>
-  ))}</div>;
-}
-
-function updateOutcomes(events: RangeEvent[]): Outcome[] {
-  return events.filter((event) => event.event_type === "sqli_episode_outcome") as Outcome[];
-}
-
-function eventKind(event: RangeEvent): { title: string; detail: string; role: string } {
-  const payload = event.payload;
-  if (event.event_type === "sqli_red_decision") {
-    const action = object(payload.action);
-    const components = object(payload.components);
-    const parts = [components.field, components.base_term, components.connector, components.predicate]
-      .filter((item) => typeof item === "string" && item !== "none")
-      .map(String).join(" · ");
-    return { title: "Red policy selected a request", detail: parts || JSON.stringify(action), role: "red" };
-  }
-  if (event.event_type === "sqli_target_response") {
-    const response = object(payload.response);
-    const telemetry = object(payload.telemetry);
-    const count = number(response.row_count) ?? number(telemetry.row_count);
-    return {
-      title: `HTTP ${text(payload.http_status, "—")} · ${text(payload.purpose, "lookup")}`,
-      detail: `${count ?? 0} rows · ${text(telemetry.evidence_status, "evidence pending")}${telemetry.challenge_disclosed ? " · phrase exposure verified" : ""}`,
-      role: "green",
-    };
-  }
-  if (event.event_type === "sqli_blue_decision") {
-    const action = object(payload.selected_action);
-    return { title: "Blue policy selected a control", detail: text(action.operation, text(payload.action, text(payload.phase))), role: "blue" };
-  }
-  if (event.event_type === "sqli_control_acknowledged") {
-    const ack = object(payload.acknowledgement);
-    return { title: `Blue control · ${text(payload.action)}`, detail: `target acknowledgement: ${text(ack.status)}`, role: "blue" };
-  }
-  if (event.event_type === "sqli_verification") {
-    return {
-      title: "Verifier checked target outcome",
-      detail: `prevention ${payload.verified_prevention ? "confirmed" : "not confirmed"} · legitimate lookup ${payload.legitimate_query_served ? "available" : "unavailable"}`,
-      role: "green",
-    };
-  }
-  if (event.event_type === "sqli_ppo_update") {
-    const metrics = object(payload.metrics);
-    return {
-      title: `${text(payload.role)} PPO update · v${text(payload.policy_version, "0")}`,
-      detail: `${text(payload.update_status)} · loss ${number(metrics.loss)?.toFixed(3) ?? "—"} · ${number(metrics.sample_count) ?? 0} accepted transitions`,
-      role: payload.role === "red" ? "red" : "blue",
-    };
-  }
-  if (event.event_type === "sqli_episode_outcome") {
-    return {
-      title: `${text(payload.phase, "episode")} · ${text(payload.winner, "no winner")}`,
-      detail: `${text(payload.reason, text(payload.status))} · ${number(payload.steps) ?? 0} rounds`,
-      role: payload.winner === "red" ? "red" : payload.winner === "blue" ? "blue" : "amber",
-    };
-  }
-  if (event.event_type === "sqli_episode_started") {
-    return { title: "Episode started", detail: `seed ${text(payload.seed)} · ${number(payload.max_steps) ?? 0} round limit`, role: "amber" };
-  }
-  return { title: event.event_type.replaceAll("_", " "), detail: "Persisted range event", role: "" };
-}
-
-function EventTimeline({ events, empty = "The first episode will appear here." }: { events: RangeEvent[]; empty?: string }) {
-  if (!events.length) return <div className="empty-state"><Activity size={18} /><span>{empty}</span></div>;
-  return <div className="timeline-scroll"><div className="timeline-list">
-    {events.map((event) => {
-      const display = eventKind(event);
-      return <article className="timeline-item" key={`${event.event_id}-${event.seq}`}>
-        <time className="timeline-time">{event.occurred_at.slice(11, 19)}<br />#{event.seq}</time>
-        <div className="timeline-content">
-          <div className="timeline-title"><span className={`timeline-dot ${display.role}`} />{display.title}</div>
-          <div className="timeline-detail">{display.detail}</div>
-          {event.event_type === "sqli_target_response" && <div className="event-response">
-            request {text(event.payload.request_id, "—")} · target event {text(event.payload.target_event_id, "—")}
-          </div>}
-        </div>
-      </article>;
-    })}
-  </div></div>;
+    {error && <div className="error-banner" role="alert"><AlertTriangle size={14} /><span>{error}</span></div>}
+    {run && <div className="training-presets-current">
+      <div className="training-presets-runline"><span className={`pill ${active ? "pill-blue" : run.status === "completed" ? "pill-green" : "pill-amber"}`}>{run.status}</span><code>{run.training_run_id}</code><span>{String(run.config.run_kind ?? "teaching")} · {String(run.config.episodes ?? 0)} updates · 32 rounds maximum</span></div>
+      <div className="progress-track" role="progressbar" aria-label="Paired PPO updates" aria-valuenow={Math.round(progress)} aria-valuemin={0} aria-valuemax={100}><div className="progress-fill" style={{ width: `${progress}%` }} /></div>
+      <div className="training-presets-progress"><strong>{completed.toLocaleString()} / {requested.toLocaleString()}</strong><span>paired optimizer updates recorded</span><span>{updates.at(-1)?.checkpoint_sha256 ? `latest checkpoint ${updates.at(-1)?.checkpoint_sha256?.slice(0, 12)}` : "checkpoint digest pending"}</span></div>
+    </div>}
+    <div className="training-resume-row">
+      <label>Resume from a saved joint checkpoint<select value={sourceId} onChange={(event) => setSourceId(event.target.value)} disabled={loading || busy || active}>
+        {!eligibleSources.length && <option value="">{loading ? "Loading checkpoint history…" : "No completed checkpoint yet"}</option>}
+        {eligibleSources.map((item) => <option key={item.training_run_id} value={item.training_run_id}>{item.status} · {String(item.config.episodes ?? 0)} updates · {item.training_run_id.slice(0, 8)}</option>)}
+      </select></label>
+      <button className="button button-secondary button-small" onClick={() => void start(10000, "research", sourceId)} disabled={busy || active || !sourceId || !targetAvailable}><Save size={13} />Resume long run from checkpoint</button>
+    </div>
+    <p className="training-presets-note">The long preset is a single-seed 10,000-update run. It checkpoints after each completed episode and can continue from the last saved pair after a stop. Multi-seed held-out evaluation is needed for claims about general improvement.</p>
+  </section>;
 }
 
 export default function TrainingMonitor() {
   const [target, setTarget] = useState<SqliTargetStatus | null>(null);
-  const [run, setRun] = useState<TrainingRun | null>(null);
-  const [outcomes, setOutcomes] = useState<Outcome[]>([]);
-  const [updates, setUpdates] = useState<RangeEvent[]>([]);
-  const [timeline, setTimeline] = useState<RangeEvent[]>([]);
+  const [campaign, setCampaign] = useState<SqliPilotStatus | null>(null);
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
-  const [streamState, setStreamState] = useState<"connecting" | "live" | "reconnecting">("connecting");
+  const evaluationStarts = useRef(new Set<string>());
 
-  const discoverCampaign = useCallback(async (restart = false) => {
-    setBusy(true);
-    setError("");
-    try {
-      const status = await rangeApi.sqliTargetStatus();
-      setTarget(status);
-      const campaign = await rangeApi.demoCampaign(restart);
-      setRun(campaign);
-      setOutcomes([]);
-      setUpdates([]);
-      setTimeline([]);
-    } catch (reason) {
-      setError(reason instanceof Error ? reason.message : "The local lab could not start.");
-    } finally {
-      setBusy(false);
-      setLoading(false);
+  const refreshStatus = useCallback(async (id: string) => {
+    const current = await rangeApi.pilotStatus(id);
+    setCampaign(current);
+    if (current.status === "ready_for_evaluation" && !evaluationStarts.current.has(id)) {
+      evaluationStarts.current.add(id);
+      try {
+        setCampaign(await rangeApi.startPilotEvaluation(id));
+      } catch (reason) {
+        evaluationStarts.current.delete(id);
+        throw reason;
+      }
     }
   }, []);
 
   useEffect(() => {
-    const timer = window.setTimeout(() => void discoverCampaign(), 0);
-    return () => window.clearTimeout(timer);
-  }, [discoverCampaign]);
+    let cancelled = false;
+    const load = async () => {
+      try {
+        const targetState = await rangeApi.sqliTargetStatus();
+        if (!cancelled) setTarget(targetState);
+        const id = window.localStorage.getItem(STORAGE_KEY);
+        if (id) {
+          const current = await rangeApi.pilotStatus(id);
+          if (!cancelled) setCampaign(current);
+          if (current.status === "ready_for_evaluation") {
+            evaluationStarts.current.add(id);
+            const updated = await rangeApi.startPilotEvaluation(id);
+            if (!cancelled) setCampaign(updated);
+          }
+        }
+      } catch (reason) {
+        if (!cancelled) setError(reason instanceof Error ? reason.message : "Could not connect to the pilot API.");
+      } finally {
+        if (!cancelled) setLoading(false);
+      }
+    };
+    void load();
+    return () => { cancelled = true; };
+  }, []);
 
   useEffect(() => {
-    if (!run?.training_run_id) return;
-    let stopped = false;
-    let source: EventSource | null = null;
-
-    const addEvent = (event: RangeEvent) => {
-      if (event.event_type === "sqli_episode_outcome") {
-        setOutcomes((current) => {
-          const next = current.filter((item) => item.event_id !== event.event_id);
-          return [...next, event as Outcome].sort((a, b) => a.seq - b.seq);
-        });
-      } else if (event.event_type === "sqli_ppo_update") {
-        setUpdates((current) => [...current.filter((item) => item.event_id !== event.event_id), event].slice(-1000));
-      }
-      setTimeline((current) => [event, ...current.filter((item) => item.event_id !== event.event_id)].slice(0, 24));
-    };
-
-    const connect = async () => {
-      let cursor = 0;
-      const summaryRows: RangeEvent[] = [];
+    if (!campaign?.campaign_id || campaign.status === "completed" || campaign.status === "incomplete") return;
+    let cancelled = false;
+    const poll = async () => {
       try {
-        for (;;) {
-          const page = await rangeApi.sqliSummary(run.training_run_id, cursor, 1000);
-          if (stopped) return;
-          summaryRows.push(...page.items);
-          if (!page.items.length || page.items.length < 1000) break;
-          if (page.next_after_seq <= cursor) break;
-          cursor = page.next_after_seq;
-        }
-        if (stopped) return;
-        setOutcomes(updateOutcomes(summaryRows).sort((a, b) => a.seq - b.seq));
-        setUpdates(summaryRows.filter((event) => event.event_type === "sqli_ppo_update").slice(-1000));
-        cursor = summaryRows.reduce((last, event) => Math.max(last, event.seq), cursor);
-        const latestOutcome = updateOutcomes(summaryRows).sort((a, b) => b.seq - a.seq)[0];
-        if (latestOutcome?.episode_id) {
-          const timelinePage = await rangeApi.episodeTimeline(run.training_run_id, latestOutcome.episode_id);
-          if (!stopped) setTimeline(timelinePage.items.slice().reverse().slice(0, 24));
-        }
-      } catch {
-        // The stream still supplies new committed events if an older summary page is unavailable.
+        await refreshStatus(campaign.campaign_id);
+        if (!cancelled) setError("");
+      } catch (reason) {
+        if (!cancelled) setError(reason instanceof Error ? reason.message : "Pilot status refresh failed.");
       }
-      if (stopped) return;
-      source = new EventSource(rangeApi.streamUrl(run.training_run_id, cursor));
-      source.onopen = () => setStreamState("live");
-      source.onerror = () => setStreamState("reconnecting");
-      source.onmessage = (message) => {
-        try {
-          addEvent(JSON.parse(message.data) as RangeEvent);
-        } catch {
-          setStreamState("reconnecting");
-        }
-      };
     };
+    const timer = window.setInterval(() => void poll(), 5000);
+    return () => { cancelled = true; window.clearInterval(timer); };
+  }, [campaign?.campaign_id, campaign?.status, refreshStatus]);
 
-    void connect();
-    const poll = window.setInterval(async () => {
-      try {
-        const [latest, targetStatus] = await Promise.all([
-          rangeApi.trainingRun(run.training_run_id),
-          rangeApi.sqliTargetStatus(),
-        ]);
-        if (!stopped) { setRun(latest); setTarget(targetStatus); }
-      } catch {
-        if (!stopped) setStreamState("reconnecting");
-      }
-    }, 5000);
-    return () => {
-      stopped = true;
-      window.clearInterval(poll);
-      source?.close();
+  useEffect(() => {
+    const poll = async () => {
+      try { setTarget(await rangeApi.sqliTargetStatus()); }
+      catch { /* The next status refresh can recover the target indicator. */ }
     };
-  }, [run?.training_run_id]);
+    const timer = window.setInterval(() => void poll(), 10000);
+    return () => window.clearInterval(timer);
+  }, []);
 
-  const trainingOutcomes = useMemo(() => outcomes.filter((item) => item.payload.phase === "training"), [outcomes]);
-  const heldOutcomes = useMemo(() => outcomes.filter((item) => item.payload.phase === "held_out_evaluation"), [outcomes]);
-  const completed = trainingOutcomes.filter((item) => item.payload.status === "completed");
-  const redWins = completed.filter((item) => item.payload.winner === "red").length;
-  const blueWins = completed.filter((item) => item.payload.winner === "blue").length;
-  const latestOutcome = trainingOutcomes.at(-1)?.payload;
-  const policyVersions = object(latestOutcome?.policy_versions ?? run?.result?.policy_versions);
-  const requested = number(run?.config.episodes) ?? 10000;
-  const progress = Math.min(100, completed.length * 100 / requested);
-  const runActive = run?.status === "queued" || run?.status === "running";
-  const targetAvailable = target?.status === "available";
-  const evaluationResult = object(run?.result?.held_out_evaluation);
-  const evalCompleted = number(evaluationResult.completed_matches) ?? heldOutcomes.filter((item) => item.payload.status === "completed").length;
-  const heldOutTotal = number(evaluationResult.requested_matches) ?? 500;
-  const redWinRate = completed.length ? redWins / completed.length : null;
-  const blueWinRate = completed.length ? blueWins / completed.length : null;
-
-  const winLines: ChartLine[] = [
-    { label: "Red wins", color: "var(--red)", values: movingAverage(completed.map((item) => item.payload.winner === "red" ? 1 : 0)) },
-    { label: "Blue wins", color: "var(--blue)", values: movingAverage(completed.map((item) => item.payload.winner === "blue" ? 1 : 0)) },
-  ];
-  const securityLines: ChartLine[] = [
-    { label: "Verified exposure", color: "var(--red)", values: movingAverage(completed.map((item) => item.payload.verified_exposure ? 1 : 0)) },
-    { label: "Verified prevention", color: "var(--blue)", values: movingAverage(completed.map((item) => number(item.payload.verified_prevention_rate))) },
-  ];
-  const availabilityLines: ChartLine[] = [
-    { label: "Legitimate lookup available", color: "var(--green)", values: movingAverage(completed.map((item) => number(item.payload.legitimate_query_availability))) },
-  ];
-  const returnLines: ChartLine[] = [
-    { label: "Red return", color: "var(--red)", values: movingAverage(completed.map((item) => number(item.payload.red_return))) },
-    { label: "Blue return", color: "var(--blue)", values: movingAverage(completed.map((item) => number(item.payload.blue_return))) },
-  ];
-  const policyLines: ChartLine[] = [
-    { label: "Red policy", color: "var(--red)", values: trainingOutcomes.map((item) => number(object(item.payload.policy_versions).red)) },
-    { label: "Blue policy", color: "var(--blue)", values: trainingOutcomes.map((item) => number(object(item.payload.policy_versions).blue)) },
-  ];
-
-  async function stopCampaign() {
-    if (!run) return;
+  async function startPilot() {
     setBusy(true);
-    try { setRun(await rangeApi.stopTrainingRun(run.training_run_id)); }
-    catch (reason) { setError(reason instanceof Error ? reason.message : "Could not request a stop."); }
-    finally { setBusy(false); }
+    setError("");
+    try {
+      const targetState = await rangeApi.sqliTargetStatus();
+      setTarget(targetState);
+      if (targetState.status !== "available") throw new Error("The isolated SQLi target is unavailable.");
+      const next = await rangeApi.startPilot();
+      window.localStorage.setItem(STORAGE_KEY, next.campaign_id);
+      setCampaign(next);
+      evaluationStarts.current.delete(next.campaign_id);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "The balanced pilot could not start.");
+    } finally {
+      setBusy(false);
+      setLoading(false);
+    }
   }
 
-  const statusLabel = run?.status === "completed" ? "Campaign complete"
-    : run?.status === "failed" ? "Campaign interrupted"
-      : run?.status === "stopped" ? "Campaign stopped"
-        : run?.status === "queued" ? "Queued for trainer"
-          : run?.status === "running" ? "Training in progress" : loading ? "Connecting to local lab" : "Waiting for a campaign";
+  async function stopTraining() {
+    if (!campaign) return;
+    setBusy(true);
+    setError("");
+    try {
+      await Promise.all(campaign.training.runs
+        .filter((item) => item.status === "queued" || item.status === "running")
+        .map((item) => rangeApi.stopTrainingRun(item.training_run_id)));
+      await refreshStatus(campaign.campaign_id);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "Could not request a graceful stop.");
+    } finally {
+      setBusy(false);
+    }
+  }
 
-  return <div>
+  async function refresh() {
+    setBusy(true);
+    setError("");
+    try {
+      setTarget(await rangeApi.sqliTargetStatus());
+      if (campaign) await refreshStatus(campaign.campaign_id);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "Could not refresh pilot status.");
+    } finally {
+      setBusy(false);
+      setLoading(false);
+    }
+  }
+
+  const training = campaign?.training;
+  const evaluation = campaign?.evaluation;
+  const activeTraining = Boolean(training?.runs.some((item) => item.status === "queued" || item.status === "running"));
+  const trainingProgress = training ? Math.min(100, 100 * training.completed_updates / Math.max(1, training.requested_updates)) : 0;
+  const evaluationProgress = evaluation ? Math.min(100, 100 * evaluation.completed_matches / Math.max(1, evaluation.requested_matches)) : 0;
+  const verdict = evaluation?.balance_verdict;
+
+  return <div className="pilot-page">
     <header className="page-header">
       <div>
-        <div className="eyebrow">Live PPO campaign · evidence-first classroom demo</div>
-        <h1 className="page-title">Two policies. One HTTP target.</h1>
-        <p className="page-deck">Red and Blue learn from the same isolated SQLi lab. Watch each policy decision, target response, independent verification, reward, and PPO update as it happens.</p>
+        <div className="eyebrow">Fresh policies · three seeds · held-out matches</div>
+        <h1 className="page-title">Balanced adversarial pilot</h1>
+        <p className="page-deck">Red and Blue choose from the same round-start evidence. Blue’s acknowledged control reaches the target before Red’s request.</p>
       </div>
       <div className="header-actions">
-        {runActive && <button className="button button-secondary" onClick={stopCampaign} disabled={busy}><CircleStop size={14} />Stop campaign</button>}
-        {(run?.status === "failed" || run?.status === "stopped") && <button className="button" onClick={() => void discoverCampaign(true)} disabled={busy}><RefreshCw size={14} />Start a fresh campaign</button>}
-        {!run && <button className="button" onClick={() => void discoverCampaign()} disabled={busy}><RefreshCw size={14} />Connect to lab</button>}
+        {activeTraining && <button className="button button-secondary" onClick={() => void stopTraining()} disabled={busy}>
+          <CircleStop size={14} />Stop at episode boundary
+        </button>}
+        <button className="button button-secondary" onClick={() => void refresh()} disabled={busy || loading}>
+          <RefreshCw size={14} />Refresh status
+        </button>
+        {!activeTraining && <button className="button" onClick={() => void startPilot()} disabled={busy || target?.status !== "available"}>
+          <ShieldCheck size={14} />Start three-seed pilot
+        </button>}
       </div>
     </header>
 
-    {error && <div className="error-banner" role="alert"><AlertTriangle size={15} />
-      <div><strong>{error}</strong><div className="micro" style={{ marginTop: 3 }}>Training requires the private target and its fixed executor to report healthy.</div></div>
-    </div>}
+    {error && <div className="error-banner" role="alert"><AlertTriangle size={15} /><span>{error}</span></div>}
 
-    <section className="campaign-grid" aria-label="Campaign status">
-      <article className="panel campaign-hero">
-        <div className="campaign-topline">
-          <span className="pill pill-amber">Single seed · demonstration only</span>
-          <span className={`pill ${runActive ? "pill-green" : run?.status === "completed" ? "pill-blue" : ""}`}>
-            <span className={`live-pip ${!targetAvailable ? "is-down" : runActive ? "is-busy" : ""}`} />{statusLabel}
-          </span>
-        </div>
-        <h2 className="campaign-name">Joint Red + Blue PPO training</h2>
-        <p className="campaign-desc">Up to 40 real request / defense rounds per episode. A joint model and both optimizer states are checkpointed after every episode for recovery.</p>
-        <div className="progress-row">
-          <span className="progress-count">{completed.length.toLocaleString()}</span>
-          <span className="progress-total">of {requested.toLocaleString()} completed PPO-updated episodes</span>
-        </div>
-        <div className="progress-track" role="progressbar" aria-label="Training campaign progress" aria-valuenow={Math.round(progress)} aria-valuemin={0} aria-valuemax={100}>
-          <div className="progress-fill" style={{ width: `${progress}%` }} />
-        </div>
-        <div className="progress-note"><span>{progress.toFixed(1)}% complete</span><span>{text(run?.config.seed, "seed pending")}</span></div>
-      </article>
-      <aside className="panel campaign-meta" aria-label="Target and run details">
-        <div className="meta-cell"><span className="meta-label">HTTP target</span><span className="meta-value" style={{ color: targetAvailable ? "var(--green)" : "var(--red)" }}>{target?.status ?? "checking"}</span></div>
-        <div className="meta-cell"><span className="meta-label">Target version</span><span className="meta-value">{text(target?.target_version, "sqli_target_v1")}</span></div>
-        <div className="meta-cell"><span className="meta-label">Checkpoint SHA-256</span><span className="meta-value">{text(run?.result?.checkpoint_sha256, runActive ? "updated each episode" : "not yet available")}</span></div>
-        <div className="meta-cell"><span className="meta-label">Event stream</span><span className="meta-value" style={{ color: streamState === "live" ? "var(--green)" : "var(--amber)" }}>{streamState}</span></div>
-      </aside>
+    <TrainingPresets targetAvailable={target?.status === "available"} />
+
+    <section className="pilot-console panel" aria-label="Pilot protocol and time window">
+      <div className="pilot-console-mark"><Bug size={17} /><span>VIOLET / PILOT 01</span></div>
+      <div><span>Target</span><strong className={target?.status === "available" ? "is-healthy" : "is-unhealthy"}>{target?.status ?? "checking"}</strong></div>
+      <div><span>Interaction</span><strong>{campaign?.interaction_protocol_schema_id ?? "sqli.round_protocol.v2"}</strong></div>
+      <div><span>Reward</span><strong>{campaign?.reward_schema_id ?? "sqli.reward.v3"}</strong></div>
+      <div><span>Training cutoff</span><strong>{time(campaign?.training_deadline ?? null)}</strong></div>
+      <div><span>Evaluation cutoff</span><strong>{time(campaign?.evaluation_deadline ?? null)}</strong></div>
     </section>
 
-    <section className="stats-grid" aria-label="Measured training outcomes">
-      <article className="panel stat-card"><span className="stat-label">Completed episodes</span><strong className="stat-value">{completed.length.toLocaleString()}</strong><span className="stat-foot">Each includes paired policy updates</span></article>
-      <article className="panel stat-card stat-red"><span className="stat-label">Red wins</span><strong className="stat-value">{pct(redWinRate)}</strong><span className="stat-foot">Target-confirmed unauthorized exposure</span></article>
-      <article className="panel stat-card stat-blue"><span className="stat-label">Blue wins</span><strong className="stat-value">{pct(blueWinRate)}</strong><span className="stat-foot">40 rounds, no exposure, lookup available</span></article>
-      <article className="panel stat-card"><span className="stat-label">Verified exposures</span><strong className="stat-value">{completed.filter((item) => item.payload.verified_exposure).length.toLocaleString()}</strong><span className="stat-foot">Joined to target evidence by request ID</span></article>
-    </section>
+    {!campaign ? <section className="panel pilot-intro">
+      <div className="panel-kicker">Explicit start · no work runs on page load</div>
+      <h2>Three new Red/Blue policy pairs</h2>
+      <p>Each seed receives up to 50 complete training episodes, with a 32-round cap. The final hour is reserved for 15 frozen matches per available seed. Evaluation seeds are disjoint from training.</p>
+      <div className="pilot-seed-list"><span>Seed 17</span><span>Seed 18</span><span>Seed 19</span></div>
+      <button className="button" onClick={() => void startPilot()} disabled={busy || target?.status !== "available"}>
+        <ShieldCheck size={14} />{loading ? "Checking pilot status…" : "Start pilot"}
+      </button>
+    </section> : <>
+      <section className="pilot-overview-grid">
+        <article className="panel pilot-progress-card">
+          <div className="pilot-card-topline"><span className="panel-kicker">Campaign {campaign.campaign_id}</span><span className={`pill ${activeTraining ? "pill-green" : ""}`}>{stateLabel(campaign.status)}</span></div>
+          <h2>Training updates</h2>
+          <div className="pilot-progress-numbers"><strong>{training?.completed_updates ?? 0}</strong><span>of {training?.requested_updates ?? 150} paired PPO updates</span></div>
+          <div className="pilot-progress-track" role="progressbar" aria-label="Training updates" aria-valuenow={Math.round(trainingProgress)} aria-valuemin={0} aria-valuemax={100}><i style={{ width: `${trainingProgress}%` }} /></div>
+          <p>Fresh initialization on seeds 17, 18, and 19. Red and Blue both update after each complete, verified episode.</p>
+        </article>
+        <article className="panel pilot-progress-card pilot-evaluation-card">
+          <div className="pilot-card-topline"><span className="panel-kicker">Frozen held-out evaluation</span><span className="pill">{evaluation?.attempted_matches ?? 0} attempts</span></div>
+          <h2>{evaluation?.completed_matches ?? 0} of {evaluation?.requested_matches ?? 45} matches complete</h2>
+          <div className="pilot-progress-track" role="progressbar" aria-label="Held-out matches" aria-valuenow={Math.round(evaluationProgress)} aria-valuemin={0} aria-valuemax={100}><i style={{ width: `${evaluationProgress}%` }} /></div>
+          <p>{evaluation?.incomplete_matches ?? 45} matches remain incomplete or unstarted. Evaluation stops at the four-hour deadline on a match boundary.</p>
+        </article>
+      </section>
 
-    <section className="chart-grid" aria-label="Training outcome charts">
-      <article className="panel"><div className="panel-head"><div><span className="panel-kicker">Measured outcomes</span><h2 className="panel-title">Win rate · rolling 100</h2></div><span className="pill">Target evidence</span></div><TrendChart lines={winLines} fixedRange={[0, 1]} /><Legend lines={winLines} /></article>
-      <article className="panel"><div className="panel-head"><div><span className="panel-kicker">Exposure and control</span><h2 className="panel-title">Verified exposure / prevention</h2></div><span className="pill">Per episode</span></div><TrendChart lines={securityLines} fixedRange={[0, 1]} /><Legend lines={securityLines} /></article>
-      <article className="panel"><div className="panel-head"><div><span className="panel-kicker">Service continuity</span><h2 className="panel-title">Legitimate lookup availability</h2></div><span className="pill pill-green">Researcher probe</span></div><TrendChart lines={availabilityLines} fixedRange={[0, 1]} /><Legend lines={availabilityLines} /></article>
-      <article className="panel"><div className="panel-head"><div><span className="panel-kicker">Agent learning</span><h2 className="panel-title">Policy version by episode</h2></div><span className="pill">Updated after episode</span></div><TrendChart lines={policyLines} labels={["episode 1", `episode ${trainingOutcomes.length.toLocaleString() || "—"}`]} /><Legend lines={policyLines} /></article>
-      <article className="panel"><div className="panel-head"><div><span className="panel-kicker">Reward signal</span><h2 className="panel-title">Red / Blue return · rolling 100</h2></div><span className="pill">PPO reward</span></div><TrendChart lines={returnLines} /><Legend lines={returnLines} /></article>
-      <article className="panel"><div className="panel-head"><div><span className="panel-kicker">Held-out matches · separate from training</span><h2 className="panel-title">Frozen-pair evaluation</h2></div><span className="pill pill-amber">500 seeded matches</span></div>
-        <div className="panel-body">
-          <div className="progress-row" style={{ marginTop: 6 }}><span className="progress-count">{evalCompleted.toLocaleString()}</span><span className="progress-total">of {heldOutTotal.toLocaleString()} complete</span></div>
-          <div className="progress-track"><div className="progress-fill" style={{ width: `${Math.min(100, evalCompleted * 100 / heldOutTotal)}%`, background: "var(--green)" }} /></div>
-          <div className="evaluation-box">
-            <div className="panel-kicker">Measured on new target seeds · no scripted opponents</div>
-            <div className="evaluation-grid">
-              <div className="evaluation-stat"><span className="micro text-muted">Red win rate</span><strong>{pct(number(evaluationResult.red_win_rate))}</strong></div>
-              <div className="evaluation-stat"><span className="micro text-muted">Blue win rate</span><strong>{pct(number(evaluationResult.blue_win_rate))}</strong></div>
-              <div className="evaluation-stat"><span className="micro text-muted">Exposure</span><strong>{pct(number(evaluationResult.verified_exposure_rate))}</strong></div>
-              <div className="evaluation-stat"><span className="micro text-muted">Availability</span><strong>{pct(number(evaluationResult.legitimate_service_availability))}</strong></div>
-            </div>
+      <section className="pilot-stat-grid" aria-label="Pooled held-out results">
+        <article className="panel pilot-stat pilot-red"><span>Red wins</span><strong>{evaluation?.red_wins ?? 0}</strong><small>{pct(evaluation?.red_win_rate ?? null)} · 95% CI {interval(evaluation?.red_win_rate_wilson_95 ?? null)}</small></article>
+        <article className="panel pilot-stat pilot-blue"><span>Blue wins</span><strong>{evaluation?.blue_wins ?? 0}</strong><small>{pct(evaluation?.blue_win_rate ?? null)} · 95% CI {interval(evaluation?.blue_win_rate_wilson_95 ?? null)}</small></article>
+        <article className="panel pilot-stat"><span>Verified disclosures</span><strong>{evaluation?.verified_disclosures ?? 0}</strong><small>Target-confirmed unauthorized reads</small></article>
+        <article className="panel pilot-stat"><span>Incomplete matches</span><strong>{evaluation?.incomplete_matches ?? 45}</strong><small>{evaluation?.attempted_matches ?? 0} attempts recorded</small></article>
+      </section>
+
+      <section className="pilot-results-grid">
+        <article className="panel pilot-results-card">
+          <div className="panel-head"><div><span className="panel-kicker">Service and control evidence</span><h2 className="panel-title">Held-out outcomes</h2></div><span className={`pill ${evaluation?.balanced ? "pill-green" : "pill-amber"}`}>{verdict?.replaceAll("_", " ") ?? "not evaluated"}</span></div>
+          <div className="pilot-metric-list">
+            <div><span>Verified disclosure rate</span><strong>{pct(evaluation?.verified_exposure_rate ?? null)}</strong></div>
+            <div><span>Verified prevention</span><strong>{pct(evaluation?.verified_prevention_rate ?? null)}</strong></div>
+            <div><span>Legitimate lookup availability</span><strong>{pct(evaluation?.legitimate_service_availability ?? null)}</strong></div>
+            <div><span>Undecided completed matches</span><strong>{evaluation?.undecided_matches ?? 0}</strong></div>
           </div>
-          <p className="micro text-muted" style={{ margin: "10px 0 0" }}>Single-seed classroom demonstration. These results are not a multi-seed research claim.</p>
-        </div>
-      </article>
-    </section>
+          <p className="pilot-verdict-note">{evaluation?.balance_rule ?? "Balance requires each side to win at least 20% and neither to exceed 80% of completed held-out matches."} A balance claim requires all 45 matches to complete.</p>
+          <p className="pilot-verdict-note">Uncertainty: {evaluation?.uncertainty_method ?? "Wilson score 95% intervals will be reported for pooled and per-seed win rates."}</p>
+        </article>
 
-    <section className="lower-grid">
-      <article className="panel">
-        <div className="panel-head"><div><span className="panel-kicker">Separate actors · shared episode boundary</span><h2 className="panel-title">Current PPO policies</h2><span className="micro text-muted">Most recent {updates.length.toLocaleString()} PPO update records loaded</span></div><Link href="/challenge" className="button button-secondary button-small">Open challenge <ArrowRight size={12} /></Link></div>
-        <div className="panel-body">
-          <div className="policy-pair">
-            <div className="policy-card red"><div className="policy-title"><span><Bug size={13} style={{ verticalAlign: "-2px", marginRight: 6 }} />Red · request policy</span><span className="pill pill-red">PPO</span></div><div className="policy-version">v{number(policyVersions.red) ?? 0}</div><div className="policy-note">bounded SQL grammar · selected probability logged</div></div>
-            <div className="policy-card blue"><div className="policy-title"><span><ShieldCheck size={13} style={{ verticalAlign: "-2px", marginRight: 6 }} />Blue · control policy</span><span className="pill pill-blue">PPO</span></div><div className="policy-version">v{number(policyVersions.blue) ?? 0}</div><div className="policy-note">sanitized telemetry · typed target controls</div></div>
+        <article className="panel pilot-seeds-card">
+          <div className="panel-head"><div><span className="panel-kicker">Training and evaluation by seed</span><h2 className="panel-title">Campaign runs</h2></div><span className="pill">{training?.runs.length ?? 0} training runs</span></div>
+          <div className="pilot-seed-table-wrap">
+            <table className="pilot-seed-table">
+              <thead><tr><th>Seed</th><th>Training</th><th>Checkpoint</th><th>Held out</th><th>Red / Blue wins</th></tr></thead>
+              <tbody>{(training?.runs ?? []).map((item) => {
+                const result = evaluation?.per_seed.find((row) => row.training_seed === item.seed);
+                return <tr key={item.training_run_id}>
+                  <th scope="row">{item.seed}</th>
+                  <td>{item.completed_episodes} / {item.requested_episodes}<small>{item.status}{item.stop_requested ? " · stop requested" : ""}</small></td>
+                  <td>{item.checkpoint_available ? `v${item.policy_versions?.red ?? "—"} / v${item.policy_versions?.blue ?? "—"}` : "unavailable"}<small>{item.checkpoint_sha256 ? item.checkpoint_sha256.slice(0, 12) : "No verified digest"}</small></td>
+                  <td>{result ? `${result.completed_matches} / ${result.requested_matches}` : "not started"}<small>{result?.evaluation_status ?? "—"}</small></td>
+                  <td>{result ? `${result.red_wins} / ${result.blue_wins}` : "—"}<small>{result ? `disclosures ${result.verified_disclosures}` : "—"}</small></td>
+                </tr>;
+              })}</tbody>
+            </table>
           </div>
-          <div className="notice" style={{ marginTop: 10 }}><strong>Evidence standard.</strong> Verifier probes measure prevention and researcher access. They never choose either agent&apos;s action.</div>
-        </div>
-      </article>
+          {evaluation?.per_seed.map((item) => <p className="pilot-seed-uncertainty" key={item.training_seed}>
+            Seed {item.training_seed}: Red {pct(item.red_win_rate)} (95% CI {interval(item.red_win_rate_wilson_95)}) · Blue {pct(item.blue_win_rate)} (95% CI {interval(item.blue_win_rate_wilson_95)}) · prevention {pct(item.verified_prevention_rate)} · availability {pct(item.legitimate_service_availability)}.
+          </p>)}
+        </article>
+      </section>
+    </>}
 
-      <article className="panel">
-        <div className="panel-head"><div><span className="panel-kicker">Persisted sequence · reconnect-safe</span><h2 className="panel-title">Latest policy / HTTP timeline</h2></div><span className="pill"><span className={`live-pip ${streamState === "live" ? "" : "is-busy"}`} />{streamState}</span></div>
-        <div className="panel-body"><EventTimeline events={timeline} empty="Waiting for policy decisions and target evidence." /></div>
-      </article>
-    </section>
-
-    <aside className="notice">
-      <strong>Runtime boundary.</strong> The executor has one fixed SQLi target and no database or public egress. The target runs on its private range network, the synthetic database is separate, and this UI is bound to localhost.
-    </aside>
+    <aside className="notice pilot-footnote"><strong>Interpretation.</strong> Training win rates are descriptive. Only the 45 frozen held-out matches determine whether the pooled result meets the stated balance threshold.</aside>
   </div>;
 }

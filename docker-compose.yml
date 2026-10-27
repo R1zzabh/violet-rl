@@ -132,6 +132,7 @@ services:
       backend:
         condition: service_started
     volumes:
+      - ./backend/violet:/app/violet:ro
       - ./backend/runs:/app/runs
       - sqli-training-runs:/var/lib/violet/sqli-runs
     read_only: true
